@@ -12,8 +12,10 @@ general:
   # offline task data which to load; it sifts through all of tdmpc data chunks
   data_dir: 
   eval_runs: 10 # number of seeds to evaluate
-  epochs: 10_000
-  eval_freq: 200
+  epochs: 1000 #10_000 # 训练过程会迭代多少次(?训练)
+  eval_freq: 200 #200 # 每 eval_freq轮迭代，触发一次评估，评估后输出奖励。
+  # 待会输出的格式 [current_epoch/total_epochs]：表示“当前训练轮次 / 总轮次”
+  # 开始前先会输出一个R，评估初始模型的性能（作为 baseline?）
   finetune_wm: False
 
 wandb:

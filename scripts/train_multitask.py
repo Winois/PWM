@@ -4,6 +4,14 @@ import torch
 
 import os, sys
 
+# 强制加入路径
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src')))
+sys.path.insert(1, os.path.abspath(os.path.join(os.path.dirname(__file__), '../external/tdmpc2')))
+
+# 手动导入你改好的 PWM 类
+from pwm.algorithms.pwm import PWM
+print(f"DEBUG >>> 正在使用的 PWM 文件路径: {PWM}") # 这行代码会输出正在使用的 PWM 类所在的模块路径，帮助确认是否正确导入了你修改后的版本。
+
 os.environ["MUJOCO_GL"] = "egl"
 os.environ["LAZY_LEGACY_OP"] = "0"
 import warnings
@@ -129,7 +137,7 @@ def make_multitask_env(cfg):
     """
     Make a multi-task environment for TD-MPC2 experiments.
     """
-    print("Creating multi-task environment with tasks:", cfg.tasks)
+    print("Creating multi-task environment with tasks:", cfg.tasks) # 这是根据命令行的任务创建环境吗 那怎么运行mt30呢
     envs = []
     for task in cfg.tasks:
         _cfg = deepcopy(cfg)
@@ -201,7 +209,11 @@ def train(cfg: dict):
     seeding(cfg.general.seed)
 
     task = cfg.task
-    task_set = TASK_SET["mt80"] if "mt80" in cfg.general.data_dir else TASK_SET["mt30"]
+    #task_set = TASK_SET["mt80"] if "mt80" in cfg.general.data_dir else TASK_SET["mt30"]
+    if cfg.general.data_dir and "mt80" in cfg.general.data_dir:
+        task_set = TASK_SET["mt80"]
+    else:
+        task_set = TASK_SET["mt30"]
     task_id = task_set.index(task)
     if "mt80" in cfg.general.data_dir:
         cfg.alg.world_model_config.task_dim = 96
@@ -235,8 +247,7 @@ def train(cfg: dict):
         logdir=logdir,
         max_epochs=cfg.general.epochs,
     )
-
-    # load model
+        # load model
     if cfg.general.checkpoint:
         agent.load_wm(cfg.general.checkpoint)
         agent.wm_bootstrapped = True
@@ -251,7 +262,8 @@ def train(cfg: dict):
     print(f"Found {len(fps)} files in {fp}")
     for fp in tqdm(fps, desc="Loading data"):
         print("Loading", fp)
-        td = torch.load(fp)
+        #td = torch.load(fp)
+        td = torch.load(fp, weights_only=False)
         assert td.shape[1] == cfg.episode_length, (
             f"Expected episode length {td.shape[1]} to match config episode length {cfg.episode_length}, "
             f"please double-check your config."
@@ -274,30 +286,36 @@ def train(cfg: dict):
         obs, act, rew = buffer.sample()
         train_metrics = agent.update(obs, act, rew, task_ids, cfg.general.finetune_wm)
 
+        # metrics收集、整合和记录在训练过程中的所有关键性能指标和统计数据。
         metrics = {
             "iteration": i,
             "total_time": time() - start_time,
         }
         metrics.update(train_metrics)
 
-        # Evaluate agent periodically
+        # 判断每当训练进行到第 eval_freq轮（或其整数倍）时，就触发一次评估
         if i % cfg.general.eval_freq == 0:
             metrics.update(eval(agent, env, task_set, task_id, cfg.general.eval_runs))
             reward = metrics[f"episode_reward"]
             print(f"R: {reward:.2f}")
             if i > 0:
-                agent.save(f"model_{i}", logdir)
+                agent.save(f"model_{i}", logdir) # 在每次评估后保存模型权重，文件名中包含当前的训练轮数 i，方便后续分析和模型选择。
 
         if i % 100 == 0:
-            if "wm_loss" not in metrics:
+            # 确保 WML 和 JAE 不为 nan
+            wml_val = metrics.get("wm_loss", np.nan)
+            jae_val = metrics.get("jae_loss", np.nan) # 获取你新加的指标
+            if "wm_loss" not in metrics: # 哪里决定在不在metrics里
                 metrics["wm_loss"] = np.nan
             print(
-                "[{:}/{:}]  AL:{:.3f}  VL:{:.3f}  WML:{:.3f}".format(
+                "[{:}/{:}]  AL:{:.3f}  VL:{:.3f}  WML:{:.3f}  JAE:{:.4f}".format(
                     i,
                     cfg.general.epochs,
                     metrics["actor_loss"],
                     metrics["value_loss"],
                     metrics["wm_loss"],
+                    wml_val,
+                    jae_val, # 加入打印 也打印了 但是0.0000 还是没有进入 finetune_wm 的分支？
                 )
             )
 
@@ -306,15 +324,15 @@ def train(cfg: dict):
             if cfg.general.run_wandb:
                 wandb.log(metrics)
 
-    agent.save(f"model_final", logdir)
+    agent.save(f"model_final", logdir) # 训练完全结束后的权重保存，文件名为 model_final，标志着这是最终版本的模型权重，可以用于后续的评估和部署。 (所以执行这个函数的时候其实是在训练吗
     print("Final evaluation")
 
-    metrics.update(eval(agent, env, task_set, task_id, cfg.general.eval_runs))
-    reward = metrics[f"episode_reward"]
-    print(f"Final reward: {reward:.2f}")
+    metrics.update(eval(agent, env, task_set, task_id, cfg.general.eval_runs)) # 在训练完成后进行最终评估，评估结果会更新到 metrics 字典中。
+    reward = metrics[f"episode_reward"] # 从评估结果中提取最终的平均每集奖励值，存储在 reward 变量中。
+    print(f"Final reward: {reward:.2f}") # 输出最终评估的奖励值，帮助我们了解训练完成后模型的性能表现。
 
     # Now do planning
-    agent.planning = True
+    agent.planning = True # 启用规划模式，允许智能体在评估阶段使用其内部世界模型进行前瞻性规划，以期望获得更好的性能。
     planning_metrics = eval(agent, env, task_set, task_id, cfg.general.eval_runs)
     metrics["episode_reward_planning"] = planning_metrics[f"episode_reward"]
     metrics["episode_success_planning"] = planning_metrics[f"episode_success"]

@@ -25,3 +25,40 @@ dflex/dflex/kernels*/
 wandb
 checkpoints
 multirun
+
+# Private keys
+key
+key.pub
+
+# Model weights
+models/
+*.pt
+*.pth
+*.ckpt
+
+# Temporary files
+*.backup
+*.save
+*.bak
+
+# Training outputs
+outputs/
+checkpoints/
+logs/
+runs/
+wandb/
+
+# Python cache
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Generated plots
+r_plots/*.png
+
+# Build artifacts
+*.o
+*.so
+.ninja_deps
+.ninja_log
+build.ninja

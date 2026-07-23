@@ -51,7 +51,7 @@ class WorldModel(nn.Module):
         self,
         observation_dim,
         action_dim,
-        latent_dim,
+        latent_dim, # state的latent_dim吗
         units,
         encoder_units,
         encoder,

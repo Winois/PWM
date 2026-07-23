@@ -11,6 +11,7 @@ class ActorDeterministicMLP(nn.Module):
         self,
         obs_dim: int,
         action_dim: int,
+        #latent_action_dim: int,
         units: List[int],
         activation_class: Type = nn.ELU,
         init_gain: float = 2.0**0.5,
@@ -18,6 +19,7 @@ class ActorDeterministicMLP(nn.Module):
         super(ActorDeterministicMLP, self).__init__()
 
         self.layer_dims = [obs_dim] + units + [action_dim]
+        #self.layer_dims = [obs_dim] + units + [latent_action_dim]
 
         if isinstance(activation_class, str):
             activation_class = eval(activation_class)
@@ -45,11 +47,12 @@ class ActorDeterministicMLP(nn.Module):
         return self.actor(observations)
 
 
-class ActorStochasticMLP(nn.Module):
+class ActorStochasticMLP(nn.Module): # 随机
     def __init__(
         self,
         obs_dim: int,
         action_dim: int,
+        #latent_action_dim: int,
         units: List[int],
         activation_class: Type = nn.ELU,
         init_gain: float = 1.0,
@@ -59,6 +62,7 @@ class ActorStochasticMLP(nn.Module):
         super(ActorStochasticMLP, self).__init__()
 
         self.layer_dims = [obs_dim] + units + [action_dim]
+        #self.layer_dims = [obs_dim] + units + [latent_action_dim]
 
         if isinstance(activation_class, str):
             activation_class = eval(activation_class)
@@ -77,9 +81,11 @@ class ActorStochasticMLP(nn.Module):
 
         self.logstd = torch.nn.Parameter(
             torch.ones(action_dim, dtype=torch.float32) * init_logstd
+            #torch.ones(latent_action_dim, dtype=torch.float32) * init_logstd
         )
 
         self.action_dim = action_dim
+        #self.latent_action_dim = latent_action_dim
         self.obs_dim = obs_dim
         self.min_logstd = min_logstd
 
