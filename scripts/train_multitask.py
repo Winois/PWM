@@ -156,6 +156,16 @@ def make_multitask_env(cfg):
 
 def eval(agent, env, task_set, task_idx, eval_episodes):
     """Evaluate a TD-MPC2 agent."""
+    actor_training = agent.actor.training
+    critic_training = agent.critic.training
+    wm_training = agent.wm.training
+    jsae_training = agent.jsae.training if agent.jsae is not None else None
+    agent.actor.eval()
+    agent.critic.eval()
+    agent.wm.eval()
+    if agent.jsae is not None:
+        agent.jsae.eval()
+
     results = dict()
     # for task_idx in tqdm(range(len(self.cfg.tasks)), desc="Evaluating"):
     ep_rewards, ep_successes = [], []
@@ -174,6 +184,11 @@ def eval(agent, env, task_set, task_idx, eval_episodes):
             f"episode_success": np.nanmean(ep_successes),
         }
     )
+    agent.actor.train(actor_training)
+    agent.critic.train(critic_training)
+    agent.wm.train(wm_training)
+    if agent.jsae is not None:
+        agent.jsae.train(jsae_training)
     return results
 
 
@@ -314,8 +329,7 @@ def train(cfg: dict):
                     metrics["actor_loss"],
                     metrics["value_loss"],
                     metrics["wm_loss"],
-                    wml_val,
-                    jae_val, # 加入打印 也打印了 但是0.0000 还是没有进入 finetune_wm 的分支？
+                    jae_val,
                 )
             )
 

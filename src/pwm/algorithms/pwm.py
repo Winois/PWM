@@ -41,12 +41,14 @@ class PWM:
         latent_dim: int,
         obs_dim: int,
         act_dim: int,
+        jsae_config: Optional[DictConfig] = None,
         actor_grad_norm: Optional[float] = None,  # clip grad norms during training
         critic_grad_norm: Optional[float] = None,  # clip grad norms during training
         num_critics: int = 3,  # for critic ensembling
         actor_lr: float = 2e-3,
         critic_lr: float = 2e-3,
         model_lr: float = 2e-3,
+        jsae_lr: float = 2e-3,
         betas: Tuple[float, float] = (0.7, 0.95),
         lr_schedule: str = "linear",
         gamma: float = 0.99,  # discount factor
@@ -98,6 +100,7 @@ class PWM:
         self.actor_lr = actor_lr
         self.critic_lr = critic_lr
         self.model_lr = model_lr
+        self.jsae_lr = jsae_lr
         self.lr_schedule = lr_schedule
         self.gamma = gamma
         self.lam = lam
@@ -141,10 +144,20 @@ class PWM:
         os.makedirs(self.log_dir, exist_ok=True)
 
         # Create actor and critic
+        self.jsae = None
+        self.latent_action_dim = self.num_actions
+        if jsae_config is not None:
+            self.jsae = instantiate(
+                jsae_config,
+                state_dim=latent_dim,
+                action_dim=self.num_actions,
+            ).to(self.device)
+            self.latent_action_dim = self.jsae.latent_action_dim
+
         self.actor = instantiate(
             actor_config,
             obs_dim=latent_dim,
-            action_dim=self.num_actions,
+            action_dim=self.latent_action_dim,
         ).to(self.device)
 
         critics = [
@@ -184,6 +197,13 @@ class PWM:
             ],
             lr=self.model_lr,
         )
+        self.jsae_optimizer = None
+        if self.jsae is not None:
+            self.jsae_optimizer = torch.optim.Adam(
+                self.jsae.parameters(),
+                lr=self.jsae_lr,
+                betas=betas,
+            )
 
         # counting variables
         self.iter_count = 0
@@ -255,6 +275,29 @@ class PWM:
     def mean_horizon(self):
         return self.horizon_length_meter.get_mean()
 
+    def _action_mask(self, actions, task):
+        if not self.wm.multitask:
+            return torch.ones_like(actions)
+        if task is None:
+            raise ValueError("task is required for multitask action masking")
+        task_ids = torch.as_tensor(task, device=actions.device).long()
+        mask = self.wm._action_masks[task_ids]
+        while mask.ndim < actions.ndim:
+            mask = mask.unsqueeze(0)
+        return mask.expand_as(actions)
+
+    def _policy_action(self, z, task, deterministic=False):
+        actor_input = z.detach() if self.detach else z
+        policy_output = torch.tanh(
+            self.actor(actor_input, deterministic=deterministic)
+        )
+        if self.jsae is None:
+            return policy_output
+
+        decoder_state = z.detach() if self.detach else z
+        actions = self.jsae.decode(decoder_state, policy_output)
+        return actions * self._action_mask(actions, task)
+
     def compute_actor_loss(self, obs=None, task=None):
 
         if obs is None:
@@ -316,12 +359,7 @@ class PWM:
                 self.obs_buf[i] = z.clone()
 
             # act in environment
-            if self.detach:
-                actions = self.actor(z.detach())
-            else:
-                actions = self.actor(z)
-
-            actions = torch.tanh(actions)
+            actions = self._policy_action(z, task)
 
             # NOTE term is not consistent here
             z, rew = self.wm.step(z, actions, task)
@@ -519,6 +557,16 @@ class PWM:
 
     @torch.no_grad()
     def eval(self, num_games, deterministic=True):
+        actor_training = self.actor.training
+        critic_training = self.critic.training
+        wm_training = self.wm.training
+        jsae_training = self.jsae.training if self.jsae is not None else None
+        self.actor.eval()
+        self.critic.eval()
+        self.wm.eval()
+        if self.jsae is not None:
+            self.jsae.eval()
+
         episode_length_his = []
         episode_loss_his = []
         episode_discounted_loss_his = []
@@ -541,9 +589,12 @@ class PWM:
         games_cnt = 0
         while games_cnt < num_games:
 
-            actions = self.actor(z, deterministic=deterministic)
-            actions = torch.tanh(actions)
-            z, rew, trunc = self.wm.step(z, actions, task=None)
+            actions = self._policy_action(
+                z,
+                task=None,
+                deterministic=deterministic,
+            )
+            z, rew = self.wm.step(z, actions, task=None)
 
             _, _, done, _ = self.env.step(actions)
 
@@ -579,6 +630,11 @@ class PWM:
             torch.Tensor(episode_discounted_loss_his)
         )
 
+        self.actor.train(actor_training)
+        self.critic.train(critic_training)
+        self.wm.train(wm_training)
+        if self.jsae is not None:
+            self.jsae.train(jsae_training)
         return mean_policy_loss, mean_policy_discounted_loss, mean_episode_length
 
     @torch.no_grad()
@@ -967,8 +1023,24 @@ class PWM:
             wm_grad_norm = clip_grad_norm_(self.wm.parameters(), self.wm_grad_norm)
             self.wm_optimizer.step()
 
+        jae_loss = None
+        if self.jsae is not None:
+            # Learn the latent action representation without updating the world model.
+            self.jsae_optimizer.zero_grad()
+            with torch.no_grad():
+                states = self.wm.encode(obs[:-1], task)
+            reconstructed_act, _ = self.jsae(states, act)
+            action_mask = self._action_mask(act, task)
+            squared_error = (reconstructed_act - act) ** 2 * action_mask
+            jae_loss = squared_error.sum() / action_mask.sum()
+            jae_loss.backward()
+            self.jsae_optimizer.step()
+
         # train actor
         self.actor_optimizer.zero_grad()
+        self.wm.requires_grad_(False)
+        if self.jsae is not None:
+            self.jsae.requires_grad_(False)
 
         # NOTE not sure about dimensionality below
         actor_loss = self.compute_actor_loss(obs[0], task)
@@ -985,6 +1057,9 @@ class PWM:
             raise ValueError
 
         self.actor_optimizer.step()
+        self.wm.requires_grad_(True)
+        if self.jsae is not None:
+            self.jsae.requires_grad_(True)
 
         # prepare dataset
         critic_batch_size = bsz * self.horizon // self.critic_batches
@@ -1031,6 +1106,8 @@ class PWM:
             "actor_grad_norm": self.actor_grad_norm_before_clip.item(),
             "critic_grad_norm": critic_grad_norm.item(),
         }
+        if jae_loss is not None:
+            metrics["jae_loss"] = jae_loss.item()
         if finetune_wm:
             metrics["wm_loss"] = wm_loss
             metrics["dynamics_loss"] = dyn_loss
@@ -1041,18 +1118,22 @@ class PWM:
 
     def save(self, filename, log_dir=None, buffer=False):
         log_dir = self.log_dir if log_dir is None else log_dir
+        checkpoint = {
+            "actor": self.actor.state_dict(),
+            "critic": self.critic.state_dict(),
+            "world_model": self.wm.state_dict(),
+            "obs_rms": self.obs_rms,
+            "rew_rms": self.rew_rms,
+            "ret_rms": self.ret_rms,
+            "actor_opt": self.actor_optimizer.state_dict(),
+            "critic_opt": self.critic_optimizer.state_dict(),
+            "world_model_opt": self.wm_optimizer.state_dict(),
+        }
+        if self.jsae is not None:
+            checkpoint["jsae"] = self.jsae.state_dict()
+            checkpoint["jsae_opt"] = self.jsae_optimizer.state_dict()
         torch.save(
-            {
-                "actor": self.actor.state_dict(),
-                "critic": self.critic.state_dict(),
-                "world_model": self.wm.state_dict(),
-                "obs_rms": self.obs_rms,
-                "rew_rms": self.rew_rms,
-                "ret_rms": self.ret_rms,
-                "actor_opt": self.actor_optimizer.state_dict(),
-                "critic_opt": self.critic_optimizer.state_dict(),
-                "world_model_opt": self.wm_optimizer.state_dict(),
-            },
+            checkpoint,
             os.path.join(self.log_dir, "{}.pt".format(filename)),
         )
         if buffer:
@@ -1067,6 +1148,11 @@ class PWM:
         self.critic.to(self.device)
         self.wm.load_state_dict(checkpoint["world_model"])
         self.wm.to(self.device)
+        if self.jsae is not None:
+            if "jsae" not in checkpoint or checkpoint["jsae"] is None:
+                raise ValueError("checkpoint does not contain JSAE parameters")
+            self.jsae.load_state_dict(checkpoint["jsae"])
+            self.jsae.to(self.device)
         self.obs_rms = (
             checkpoint["obs_rms"].to(self.device)
             if checkpoint["obs_rms"] is not None
@@ -1090,6 +1176,11 @@ class PWM:
         self.critic_lr = checkpoint["critic_opt"]["param_groups"][0]["lr"]
         self.wm_optimizer.load_state_dict(checkpoint["world_model_opt"])
         self.model_lr = checkpoint["world_model_opt"]["param_groups"][0]["lr"]
+        if self.jsae_optimizer is not None:
+            if "jsae_opt" not in checkpoint or checkpoint["jsae_opt"] is None:
+                raise ValueError("checkpoint does not contain a JSAE optimizer")
+            self.jsae_optimizer.load_state_dict(checkpoint["jsae_opt"])
+            self.jsae_lr = checkpoint["jsae_opt"]["param_groups"][0]["lr"]
 
         if buffer:
             print("Loading buffer too")
@@ -1218,8 +1309,8 @@ class PWM:
     def act(self, obs, t0=False, deterministic=False, task=None):
         obs = torch.tensor(obs, dtype=torch.float32, device=self.device)[None]
         z = self.wm.encode(obs, task)
-        a = self.actor(z, deterministic)
-        return torch.tanh(a).cpu().detach().flatten()
+        action = self._policy_action(z, task, deterministic)
+        return action.cpu().detach().flatten()
 
     def update_lrs(self, epoch):
         # learning rate schedule
@@ -1245,6 +1336,16 @@ class PWM:
             for param_group in self.wm_optimizer.param_groups:
                 param_group["lr"] = model_lr
 
+            if self.jsae_optimizer is not None:
+                jsae_lr = (1e-5 - self.jsae_lr) * float(
+                    epoch / self.max_epochs
+                ) + self.jsae_lr
+                for param_group in self.jsae_optimizer.param_groups:
+                    param_group["lr"] = jsae_lr
+                return actor_lr, critic_lr, model_lr, jsae_lr
+
             return actor_lr, critic_lr, model_lr
         else:
+            if self.jsae_optimizer is not None:
+                return self.actor_lr, self.critic_lr, self.model_lr, self.jsae_lr
             return self.actor_lr, self.critic_lr, self.model_lr
