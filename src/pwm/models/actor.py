@@ -138,3 +138,80 @@ class ActorStochasticMLP(nn.Module): # 随机
         dist = Normal(mu, std)
 
         return dist.log_prob(actions)
+
+
+class JointStateActionAutoEncoder(nn.Module):
+    """State-conditioned action autoencoder used to learn latent actions."""
+
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        latent_action_dim: int,
+        units: List[int],
+        activation_class: Type = nn.Mish,
+    ):
+        super().__init__()
+        if latent_action_dim <= 0:
+            raise ValueError("latent_action_dim must be positive")
+
+        if isinstance(activation_class, str):
+            activation_class = eval(activation_class)
+
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.latent_action_dim = latent_action_dim
+        self.encoder = self._build_mlp(
+            state_dim + action_dim,
+            units,
+            latent_action_dim,
+            activation_class,
+        )
+        self.decoder = self._build_mlp(
+            state_dim + latent_action_dim,
+            list(reversed(units)),
+            action_dim,
+            activation_class,
+        )
+
+    @staticmethod
+    def _build_mlp(input_dim, units, output_dim, activation_class):
+        dims = [input_dim] + list(units) + [output_dim]
+        layers = []
+        for index in range(len(dims) - 1):
+            layers.append(nn.Linear(dims[index], dims[index + 1]))
+            if index < len(dims) - 2:
+                layers.append(activation_class())
+                layers.append(nn.LayerNorm(dims[index + 1]))
+        return nn.Sequential(*layers)
+
+    def encode(self, state, action):
+        if state.shape[:-1] != action.shape[:-1]:
+            raise ValueError(
+                "state and action must have identical batch/time dimensions"
+            )
+        if state.shape[-1] != self.state_dim:
+            raise ValueError(f"expected state feature dim {self.state_dim}")
+        if action.shape[-1] != self.action_dim:
+            raise ValueError(f"expected action feature dim {self.action_dim}")
+        return torch.tanh(self.encoder(torch.cat((state, action), dim=-1)))
+
+    def decode(self, state, latent_action):
+        if state.shape[:-1] != latent_action.shape[:-1]:
+            raise ValueError(
+                "state and latent_action must have identical batch/time dimensions"
+            )
+        if state.shape[-1] != self.state_dim:
+            raise ValueError(f"expected state feature dim {self.state_dim}")
+        if latent_action.shape[-1] != self.latent_action_dim:
+            raise ValueError(
+                f"expected latent action feature dim {self.latent_action_dim}"
+            )
+        return torch.tanh(
+            self.decoder(torch.cat((state, latent_action), dim=-1))
+        )
+
+    def forward(self, state, action):
+        latent_action = self.encode(state, action)
+        reconstructed_action = self.decode(state, latent_action)
+        return reconstructed_action, latent_action

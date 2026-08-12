@@ -1,0 +1,360 @@
+
+\documentclass{article} % For LaTeX2e
+\usepackage{iclr2025_conference,times}
+
+% Optional math commands from https://github.com/goodfeli/dlbook_notation.
+\input{math_commands.tex}
+
+\usepackage[utf8]{inputenc} % allow utf-8 input
+\usepackage[T1]{fontenc}    % use 8-bit T1 fonts
+\usepackage{hyperref}       % hyperlinks
+\hypersetup{
+ colorlinks=True,
+ linkcolor=black,
+ citecolor=gray,
+ urlcolor=nhorange}
+\usepackage{url}            % simple URL typesetting
+\usepackage{booktabs}       % professional-quality tables
+\usepackage{amsfonts}       % blackboard math symbols
+\usepackage{nicefrac}       % compact symbols for 1/2, etc.
+\usepackage{microtype}      % microtypography
+\usepackage{xcolor}         % colors
+\usepackage{tcolorbox}
+\usepackage[ruled]{algorithm2e}
+\SetKwComment{Comment}{$\triangleright$\ }{}
+\usepackage{wrapfig}
+\usepackage{soul}
+\usepackage{subfig}
+\usepackage[export]{adjustbox}
+
+\usepackage{graphicx}
+\usepackage{tabularray}
+\usepackage{multicol}
+\usepackage{multirow}
+\usepackage{xfrac}
+\usepackage{nicematrix}
+\usepackage[font=small,labelfont=bf]{caption}
+\usepackage{xspace}
+\usepackage{xcolor,cancel}
+\usepackage{enumitem}
+\usepackage{pythonhighlight}
+
+\definecolor{nhred}{HTML}{D62727}
+\definecolor{nhorange}{HTML}{E69139}
+\definecolor{cella}{rgb}{1.0, 0.92, 0.92}
+
+% reduce equation spacing
+% \setlength{\abovedisplayskip}{3pt}
+\setlength{\belowdisplayskip}{3pt}
+% \setlength{\abovedisplayshortskip}{3pt}
+\setlength{\belowdisplayshortskip}{3pt}
+
+
+% \title{PWM: Policy Learning with Multi-Task World Models}
+\title{PWM: Policy Learning with Multi-Task\\World Models}
+
+% Authors must not appear in the submitted version. They should be hidden
+% as long as the \iclrfinalcopy macro remains commented out below.
+% Non-anonymous submissions will be rejected without review.
+
+\author{
+\makebox[\textwidth]{Ignat Georgiev \textsuperscript{1}, \hspace{5pt} Varun Giridhar \textsuperscript{1}, \hspace{5pt} Nicklas Hansen \textsuperscript{2}, \hspace{5pt} Animesh Garg \textsuperscript{1}}  \\
+\makebox[\textwidth]{\textsuperscript{1} Georgia Institute of Technology \hspace{10pt} \textsuperscript{2} UC San Diego}
+}
+
+% The \author macro works with any number of authors. There are two commands
+% used to separate the names and addresses of multiple authors: \And and \AND.
+%
+% Using \And between authors leaves it to \LaTeX{} to determine where to break
+% the lines. Using \AND forces a linebreak at that point. So, if \LaTeX{}
+% puts 3 of 4 authors names on the first line, and the last on the second
+% line, try using \AND instead of \And before the third author name.
+
+\newcommand{\fix}{\marginpar{FIX}}
+\newcommand{\new}{\marginpar{NEW}}
+
+\iclrfinalcopy % Uncomment for camera-ready version, but NOT for submission.
+\begin{document}
+
+
+\maketitle
+
+\begin{abstract}
+    Reinforcement Learning (RL) has made significant strides in complex tasks but struggles in multi-task settings with different embodiments. World model methods offer scalability by learning a simulation of the environment but often rely on inefficient gradient-free optimization methods for policy extraction. In contrast, gradient-based methods exhibit lower variance but fail to handle discontinuities. Our work reveals that well-regularized world models can generate smoother optimization landscapes than the actual dynamics, facilitating more effective first-order optimization. We introduce Policy learning with multi-task World Models (PWM), a novel model-based RL algorithm for continuous control. Initially, the world model is pre-trained on offline data, and then policies are extracted from it using first-order optimization in less than 10 minutes per task. PWM effectively solves tasks with up to 152 action dimensions and outperforms methods that use ground-truth dynamics. Additionally, PWM scales to an 80-task setting, achieving up to 27\% higher rewards than existing baselines without relying on costly online planning. Visualizations and code are available at \href{https://www.imgeorgiev.com/pwm/}{\texttt{imgeorgiev.com/pwm}}.
+\end{abstract}
+
+\begin{figure}[h!]
+    \centering
+    \subfloat{\includegraphics[width=0.5\textwidth]{img/teaser.drawio.pdf}}
+    \hfill
+    \subfloat{\includegraphics[width=0.46\textwidth]{img/teaser.pdf}}
+    \caption{We propose PWM, a new method for multi-task RL that utilizes pre-trained world models to learn policies for each task. When sufficiently regularized, these world models induce smooth optimization landscapes, which allows for efficient first-order optimization. Our approach can solve tasks in <10 minutes and achieves higher rewards in both single-task and multi-task environments.}
+    \label{fig:teaser}
+\end{figure}
+
+\section{Introduction} \label{sec:intro}
+
+% - large datasets have propelled ML to new highs; robotics is following but slowly via BC
+% - this paradigm of training offline has generated quite the success but is inherently limited to the quality of data 
+% - RL doesn't have this limitation and can use any data but has struggled to scale to multi-task settings and is plagued by sample inefficiency
+% - Recent work has successfully tackled multi-task RL through the world model framework but remains inefficient due to its use of zero-th order optimization and cannot scale to large models due to online planning
+% - We attempt to address this sample inefficiency issue by FoGs. We explore the tight coupling of FoG optimization and the world models through the lens of differentiable simulation. Counter-intuitively, we find that for efficient optimization, we don't want world models to be accurate but to be smooth and have a low optimality gap.
+% - Building on these insights, we propose PWM, and algorithm that can learn policies from offline pre-trained world models in under <10 minutes per task. Given this new-found efficiency, we also propose a new multi-task paradigm, instead of building a single multi-task policy, we can just extract policies from the world model when needed.
+% - Our empirical evaluations on complex locomotion tasks indicate that PWM not only achieves higher reward than baselines but also outperforms methods that use ground-truth simulation dynamics. In a multi-task scenario utilizing a pre-trained 48M parameter world model, PWM achieves up to 27\% higher reward than TD-MPC2 without relying on online planning.
+
+The pursuit of generalizability in machine learning has recently been propelled by the training of large models on substantial datasets \citet{brown2020language,kirillov2023segment,bommasani2021opportunities}. Such advancements have notably permeated robotics, where multi-task behavior cloning techniques have shown remarkable performance~\citet{brohan2023rt,team2023octo, goyal2023rvt,bousmalis2023robocat}. Nevertheless, these approaches predominantly hinge on near-expert data and struggle with adaptability across diverse robot morphologies due to their dependence on teleoperation~\citet{brohan2023rt,team2023octo,kumar2021should}.
+
+In contrast, Reinforcement Learning (RL) offers a robust framework capable of learning from suboptimal data, addressing the aforementioned limitations. However, traditional RL has been focused on single-task experts \citet{mnih2013playing,schulman2017proximal,haarnoja2018soft}. Recently, \citet{hansen2023td} suggested that a potential pathway to multi-task RL is with the world models framework, where a large model learns the environment dynamics and is then combined with Zeroth-order Gradient (ZoG) methods. Despite advancements, ZoG methods struggle with sample inefficiency due to the  high variance \citet{mohamed2020monte,suh2022differentiable,parmas2023model} and online planning time scales with model size, rendering it infeasible at scale.
+
+First-order Gradient (FoG) methods provide a low-variance alternative that have shown superior sample efficiency and asymptotic performance when combined with smooth differentiable simulations \citet{xu2022accelerated}. However, they struggle to optimize through discontinuities \citet{suh2022differentiable,georgiev2024adaptive}. In this work, we explore the tight coupling between FoG optimization and world models through the lens of differentiable simulation. Counter-intuitively, we find that for gradient-based optimization, we don't want world models to be accurate; instead, we want them to be smooth and have a low optimality gap. This in turn enables efficient FoG optimization.
+
+Building on these insights, we propose Policy learning with multi-task World Models (PWM), an algorithm that can learn policies from offline pre-trained world models in under <10 minutes per task. With this new-found efficiency, we also propose a \textit{new multi-task framework}, where instead of training a multi-task algorithm, we only train a multi-task world model and then extract a policy for each task. This decoupling of the supervised and RL objectives results in more stable and efficient learning with higher episode rewards. Our empirical evaluations on high-dim. tasks indicate that PWM not only achieves higher reward than baselines but also outperforms methods that use ground-truth dynamics. In a multi-task scenario utilizing a pre-trained 48M parameter world model from TD-MPC2, PWM achieves up to 27\% higher reward than TD-MPC2 without relying on online planning. This underscores the efficacy of PWM and supports our broader contributions:
+
+\begin{enumerate}
+    \item \textbf{Correlation Between World Model Smoothness and Policy Performance:} Through pedagogical examples and ablations, we demonstrate that smoother, better-regularized world models significantly enhance policy performance. Notably, this results in an inverse correlation between model accuracy and policy performance.
+    \item \textbf{Efficiency of First-Order Gradient (FoG) Optimization:} We show that combining FoG optimization with well-regularized world models enables more efficient policy learning compared to zeroth-order methods. Furthermore, policies learned from world models asymptotically outperform those trained with ground-truth simulation dynamics, emphasizing the importance of the tight relationship between FoG optimization and world model design.
+    \item \textbf{Scalable Multi-Task Algorithm:} Instead of training a single multi-task policy model, we propose PWM, a framework where a multi-task world model is first pre-trained on offline data. Then per-task expert policies are extracted in <10 minutes per task, offering a clear and scalable alternative to existing methods focused on unified multi-task models.
+\end{enumerate}
+
+\section{Background} \label{sec:bg}
+
+We focus on discrete-time and infinite-horizon Reinforcement Learning (RL) scenarios characterized by system states $\vs \in \mathbb{R}^n = \mathcal{S}$, actions $\va \in \mathbb{R}^m = \mathcal{A}$, dynamics function $f: \mathcal{S} \times \mathcal{A} \rightarrow \mathcal{S}$ and a reward function  $r: \mathcal{S} \times \mathcal{A} \rightarrow \mathbb{R}$. Combined, these form a Markov Decision Problem (MDP) summarized by the tuple $(\mathcal{S}, \mathcal{A}, f, r, \gamma)$ where $\gamma$ is the discount factor. Actions at each timestep $t$ are sampled from a stochastic policy $\va_t \sim \pi_\theta (\cdot | \vs_t)$, parameterized by $\vtheta$. The goal of the policy is to maximize the cumulative discounted rewards:
+\vspace{-0.2cm}
+\begin{align}
+    \label{eq:objective}
+    \max_\vtheta J(\vtheta) := \max_\vtheta \E[\substack{\vs_1 \sim \rho(\cdot) \\ \va_t \sim \pi_\vtheta (\cdot | \vs_t)}]{\sum_{t=1}^\infty \gamma^t r(\vs_t, \va_t)}
+\end{align}
+where $\rho(\vs_1)$ is the initial state distribution. Since this maximization over an infinite sum is intractable, in practice we often maximize over a value estimate. The value of a state $\vs_t$ is defined as the expected reward following the policy $\pi_\vtheta$
+\vspace{-0.2cm}
+\begin{align}
+    \label{eq:value}
+    V^\pi_\vpsi (\vs_t) := \E[\va_h \sim \pi_\vtheta(\cdot | \vs_h)]{\sum_{h=t}^\infty \gamma^h r(\vs_h, \va_h)}
+\end{align}
+When $V$ is approximated with a learned model with parameters $\vpsi$ and $\pi_\vtheta$ attempts to maximize some function of $V$, we arrive at the popular and successful actor-critic architecture \citet{konda1999actor}. Additionally, in MBRL it is common to also learn approximations of $f$ and $r$, which we denote as $F_\vphi$ and $R_\vphi$, respectively. It has also been shown to be beneficial to encode the true state $\vs$ into a latent state $\vz$ using a learned encoder $E_\vphi$ \citet{hafner2019dream,hansen2022temporal,hansen2023td,hafner2023mastering}. Putting together all of these components, we can define a model-based actor-critic algorithm to consist of the tuple $(\pi_\vtheta, V_\vpsi, E_\vphi, F_\vphi, R_\vphi$) which can describe popular approaches such as Dreamer \citet{hafner2019dream,hafner2023mastering} and TD-MPC2 \citet{hansen2023td}. Notably, we make an important distinction between the types of components. We refer to $E_\vphi$, $F_\vphi$ and $R_\vphi$ as the \textit{world model components} since they are supervised learning problems with fixed targets. On the other hand, $\pi_\theta$ and $V_\psi$ optimize for moving targets, which is fundamentally more challenging, and we refer to them as the \textit{policy components}.
+
+\section{Policy optimization through world models} \label{sec:mbrl}
+
+This paper builds on the insight that since access to $F_\vphi$ and $R_\vphi$ is assumed through a pre-trained world model, we have the option to optimize Eq. \ref{eq:objective} via \textit{First-order Gradient (FoG) optimization} which exhibit lower gradient variance, more optimal solutions, and improved sample efficiency \citet{mohamed2020monte}. In our setting, these types of gradients are obtained by directly differentiating the expected terms of Eq. \ref{eq:objective} as shown in Eq. \ref{eq:first-order-grads}. Note that this gradient estimator is also known as reparameterized gradient \citet{kingma2015variational} and pathwise derivative \citet{schulman2015gradient}. While we use the explicit $\nabla^{[1]}$ notation below, we later drop it for simplicity as all gradient types in this work are first-order gradients.
+\begin{align}
+    \label{eq:first-order-grads}
+    \nabla_{\vtheta}^{[1]} J(\vtheta) := \E[\substack{\vs_1 \sim \rho(\cdot) \\ \va_h \sim \pi_\vtheta (\cdot | \vs_h)}]{\nabla_\vtheta \bigg( \sum_{t=1}^\infty \gamma^t r(\vs_t, \va_t) \bigg)}
+\end{align}
+
+As $\nabla_{\vtheta}^{[1]} J(\vtheta)$ in itself is a random variable, we need to estimate it. A popular way to do that in practice is via Monte-Carlo approximation, where we are interested in two properties: bias and variance. In Sections \ref{sec:learning-through-contact} and \ref{sec:learning-chaos} we tackle each aspect with a toy robotic control problem to build intuition. In Section \ref{sec:method}, we combine our findings to propose a new algorithm.
+
+\subsection{Learning through contact} \label{sec:learning-through-contact}
+
+\begin{figure}[t]
+    \centering
+    \subfloat[Ball-wall visualization.]{\includegraphics[width=0.25\textwidth,valign=b]{img/ball-wall-4.pdf} \label{fig:ball-wall-drawing}}
+    \hfill
+    \subfloat[Problem landscape.]{\includegraphics[width=0.35\textwidth,valign=b]{img/ball_wall.pdf} \label{fig:ball-wall}}
+    \hfill
+    \subfloat[Model error and optimality gap.]{
+        \adjustbox{valign=b}{
+        \begin{NiceTabular}{ p{1.2cm} p{1.2cm} p{1.2cm} }
+            \CodeBefore
+              \rowcolor[HTML]{D6D6EB}{1}
+              \rowcolors[HTML]{2}{eaeaf3}{FFFFFF} % seaborn colors
+            \Body
+            \toprule
+            Model         & Model error & Opt. gap \\ \midrule
+            True    & 0.0        & 16.85           \\
+            ReLU    & 0.71       & 16.05          \\
+            SimNorm & 1.13       & 3.47           \\ \bottomrule
+        \end{NiceTabular}}
+        \label{tab:ball-wall}
+    }
+    \caption{\textbf{Ball-wall pedagogical example.} The \textbf{left} figure visualizes the problem. The middle figure shows the problem landscape induced by each model. $J(\theta)$ shows the true underlying function and the two other are MLPs with different activation functions. We minimize each of these problems using gradient descent and starting at $\theta=-\pi$ (marker \textbf{$\times$}). The colored crosses represent the solutions converged to for each model. The \textbf{right} table shows the model approximation error during training and the optimality gap $| J(\theta^*) - J(\hat{\theta}) |$ between the global minimum $\theta^*$ and the solution found for each model $\hat{\theta}$.}
+    % \label{fig:teaser}
+\end{figure}
+
+
+
+FoGs are unbiased $\E{\bar{\nabla}^{[1]} J(\vtheta)} := \E{ \sum_{n=1}^N \hat{\nabla}^{[1]}_n J(\vtheta)} = \nabla J(\vtheta)$, only if both the dynamics $f$ and rewards $r$ are Lipschitz-smooth \citet{suh2022differentiable}. However, many robotic problems involving contact are inherently non-smooth, which breaks these conditions and results in gradient sample error where $\E{\bar{\nabla}^{[1]} J(\vtheta)} \neq \nabla J(\vtheta)$ under a finite number of samples $N$. Instead of directly optimizing the true, discontinuous objective, it is advantageous to optimize a smooth surrogate, such as a model learned by a regularized deep neural network.
+
+To illustrate this concept, we use a toy problem where a ball is thrown toward a wall at a fixed velocity, as shown in Figure \ref{fig:ball-wall-drawing}. The objective is to find the optimal initial angle $\theta$ such that we maximize forward distance. In this simplified pedagogical example, we assume that the ball "sticks" to the wall, creating a discontinuous optimization landscape (Figure \ref{fig:ball-wall}). We compare the performance of two models in approximating this objective: a 2-layer Multi-Layer Perceptron (MLP) with ReLU activation and another MLP with SimNorm activation \citet{hansen2023td} in the intermediate layers. SimNorm normalizes a latent vector $\vz$ by projecting it into simplices with dimension $P$ using a softmax operator. Given an input vector $\vz$, SimNorm can be expressed as a mapping into $L$ vectors: 
+\begin{align} \label{eq:simnorm}
+    \text{SimNorm}(\vz) := [\vg_1, ..., \vg_L], \quad \vg_i = \text{Softmax}(\vz_{i: i+P})
+\end{align}
+
+We trained both MLPs and observed their effects on smoothing the optimization landscape (Figure \ref{fig:ball-wall}). The ReLU-activated MLP smooths the landscape but introduces a local minimum that hinders gradient descent, particularly when starting from $\theta = -\pi$, resulting in a large optimality gap (difference between the solution and the optimal solution: $\| \hat{\theta} - \theta^* \|$). In contrast, the SimNorm-activated MLP has additional regularization, which reduces the optimality gap at the expense of model accuracy (Table \ref{tab:ball-wall}). This example highlights that more accurate models do not always lead to better policies, as noted by \cite{lambert2020objective}. Our findings extend this by showing that for FoG optimization, prioritizing smoothness over accuracy can lead to improved results. Further details are provided in Appendix \ref{app:ball-wall}.
+
+\subsection{Learning with chaotic dynamics} \label{sec:learning-chaos}
+
+While FoGs have lower variance per step, they can accumulate significant variance over long-horizon rollouts \citet{metz2021gradients}. \citet{suh2022differentiable} link this variance to the smoothness of models and the length of the prediction horizon: $\Var{\nabla J^{[1]}} \propto \| \nabla f(s,a) \|^{2H}$. At sufficiently high $H$, the high variance renders FoGs ineffective in chaotic systems. Chaotic systems are characterized by their sensitivity to initial conditions, where small perturbations can lead to exponentially divergent trajectories, making long-term prediction particularly challenging. The double pendulum, also known as the Acrobot \citet{murray1991case}, is a classic example of such a system (Figure \ref{fig:double-pendulum}).
+
+We analyze the variance of gradient estimators in the double pendulum using both the true dynamics and a SimNorm-activated MLP model. The MLP model was trained for auto-regressive prediction horizons of $H=3$ and $H=16$ until convergence on a large dataset. Figure \ref{fig:double-pendulum} shows that both learned models exhibit reduced variance compared to the true dynamics. However, as noted by \citet{parmas2023model}, variance alone is insufficient for drawing definitive conclusions about gradient quality. Instead, they propose analyzing gradients via their Expected Signal-to-Noise Ratio (ESNR), defined as:
+\begin{align} \label{eq:esnr}
+    \operatorname{ESNR}(\nabla J(\vtheta)) = \E{\dfrac{\sum \E{\nabla^{[1]} J (\vtheta)}^2}{\sum \Var{\nabla^{[1]} J (\vtheta)}}}
+\end{align}
+In Figure \ref{fig:double-pendulum}, we observe that learned models exhibit higher ESNR than the true dynamics, providing more useful gradients. Notably, the training horizon plays a critical role, with the $H=16$ model sustaining a higher ESNR over higher $H$. We conclude that learned world models offer more informative policy gradients than the true system dynamics. Further details in Appendix \ref{app:double-pendulum}.
+
+\begin{figure*}
+     \centering
+     \subfloat{\includegraphics[width=0.12\textwidth]{img/double-pendulum-1.pdf}}
+     \hfill
+     \subfloat{\includegraphics[width=0.8\textwidth]{img/sensitivity.pdf}}
+    \caption{\textbf{Double pendulum pedagogical example.} The middle figure evaluates the variance of policy gradient estimates over $N=100$ Monte-Carlo samples for varying horizons $H$. The right figure shows the same data but plots the Expected Signal-to-Noise ratio (ESNR) with higher values translating to more useful gradients. These results suggests that world models trained over long horizon trajectories provide more useful gradients. Note that $H=3$ and $H=16$ in the figure legends refer to the training horizon of the models.}
+    \label{fig:double-pendulum}
+\end{figure*}
+
+\newpage
+\subsection{PWM: Policy learning with multi-task World Models} \label{sec:method}
+
+\begin{wrapfigure}[25]{R}{0.5\textwidth}
+    \vspace{-0.175in}
+    \begin{algorithm}[H]
+        \SetCustomAlgoRuledWidth{0.45\textwidth}
+       \caption{PWM: Policy learning with multi-task World Models}
+       \label{alg:algo}
+        \textbf{Given}: Multi-task dataset $\mathcal{B}$ \\
+        \textbf{Given}: $\gamma$: discount rate \\
+        % \State \textbf{Given}: pre-trained world model ($E_\phi, F_\vphi, R_\vphi$)
+        \textbf{Given}: $\alpha_\vtheta, \alpha_\vpsi, \alpha_\vphi$: learning rates \\
+        \textbf{Initialize learnable parameters} $\vtheta, \vpsi, \vphi$ \\
+        % \vskip 6pt
+        \Comment{Pre-train world model once}
+        % \For(\Comment*[f]{pretrain wm}){N epochs}{
+        \For{N epochs}{
+            $\vs_{1:H}, \va_{1:H}, r_{1:H}, \ve \sim \mathcal{B}$ \\
+            $\vphi \gets \vphi - \alpha_\vphi \nabla \mathcal{L}_{wm}(\vphi)$ \Comment*[f]{Eq. \ref{eq:wm-update}} \\
+        }
+        % \vskip 6pt
+        \Comment{Train policy on task embedding $\ve$}
+        \For{M epochs}{
+            $\vs_1 \sim \mathcal{B}$ \\
+            $\vz_1 = E_\vphi (\vs_1, \ve)$ \\
+            \For(\Comment*[f]{Rollout}){h=[1, ..., H]}{
+                $\va_h \sim \pi_\vtheta(\cdot | \vz_h)$ \\
+                $r_h = R_\phi(\vz_h, \va_h, \ve)$ \\ 
+                $\vz_{h+1} = F_\phi(\vz_h, \va_h, \ve)$ \\
+                % \mathcal{D} \leftarrow \mathcal{D} \cup \{(\vz_h, \va_h, r_h)\}
+            }
+            $\vtheta \gets \vtheta + \alpha_\vtheta \nabla \mathcal{L}_\pi(\vtheta)$  \Comment*[f]{Eq. \ref{eq:actor-objectice}}\\
+            $\vpsi \gets \vpsi - \alpha_\vpsi \nabla \mathcal{L}_V(\vpsi)$ \Comment*[f]{Eq. \ref{eq:td-1}-\ref{eq:td-3}}\\
+        }
+    \end{algorithm}
+\end{wrapfigure}
+
+Given the results from the previous subsection, we propose to view world models not as components of RL methods but instead as scalable, differentiable physics simulators that provide gradients with low sample error and variance. It is worth noting that approaches such as TD-MPC2 \citet{hansen2023td} do not exploit these properties but rather choose to optimize policies via DDPG-style gradients: \\ $\nabla_\vtheta J(\vtheta) \approx \E[\va \sim \pi (\cdot | s)]{\nabla_\vtheta Q(\vs,\va)}$.
+
+We propose a new method and framework for efficiently learning policies from large multi-task world models.\\ \textbf{Framework.} Assuming availability of data from multiple tasks, we first train a multi-task world model to predict future states and rewards. Then for each task we want to solve, we learn a single policy in minutes using FoG optimization. The policy is then deployed to solve the task and optionally fine-tune its world model and policy.
+\\\textbf{Method.} For policy learning, we propose on-policy actor-critic approach inspired by differentiable simulation approaches \citet{xu2022accelerated} where the actor is trained via FoG back-propagated through the world model, while the critic is trained via TD($\lambda$). The key to our approach is that training is done in a batched fashion where multiple trajectories are imagined in parallel. The actor loss function is akin to Eq. \ref{eq:objective} but features rewards over a fixed horizon $H$, terminal value bootstrapping and usage of the learned world model components: 
+\begin{align}
+    \label{eq:actor-objectice}
+    \mathcal{L}_\pi(\vtheta) := \E[\substack{\vs_1 \sim \rho(\cdot) \\ \va_h \sim \pi_\vtheta(\cdot | \vz_h)}]{ \sum_{h=1}^{H-1} \gamma^h R_\phi(\vz_h, \va_h) + \gamma^H V_\vpsi (\vz_H) } \quad \text{where} \quad \substack{\vz_1 = E_\vphi(\vs_1)  \\ \vz_{t+1} = F_\vphi (\vz_t, \va_t)}
+\end{align}
+The critic is trained in a model-free fashion using TD($\lambda$) over an $H$-step rollout in latent space $\vz$ as seen in other similar on-policy methods \citet{sutton2018reinforcement,hafner2019dream,xu2022accelerated}:
+\begin{align}
+    V_h(\vz_t) := \sum_{n=t}^{t+h-1} \gamma^{n-t} R_\phi(\vz_n, \va_n) + \gamma^{t+h} V_\vpsi (\vz_{t+h}) \label{eq:td-1}\\
+    \hat{V}(\vz_t) := (1-\lambda) \bigg[ \sum_{h=1}^{H-t-1} \lambda^{h-1} V_h(\vz_t) \bigg] + \lambda^{H-t-1} V_H(\vz_t) \\
+    \mathcal{L}_V(\vpsi) := \sum_{h=t}^{t+H} \norm{V_\vpsi(\vz_h) - \hat{V}(\vz_h)}_2^2 \label{eq:td-3}
+\end{align}
+We use an ensemble of 3 critics to reduce variance. To enable FoG optimization, it is important to use a well-regularized world model. We use the $\big( E_\phi(\vs, \ve), F_\phi(\vs, \va, \ve), R_\phi(\vs, \va, \ve) \big)$ model proposed by TD-MPC2 \citet{hansen2023td} with learnable task embeddings $\ve$. It is trained in an auto-regressive fashion by sampling data from a buffer with loss function:
+\begin{align} \label{eq:wm-update}
+    \mathcal{L}_{\text{wm}}(\vphi) = \E[(\vs, \va, r, \vs', \ve)_{0:H} \sim \mathcal{B}]{\sum_{t=0}^H \gamma^t \big( \| \vz_{t+1} - sg(E_\phi(\vs_{t+1}, \ve)) \|_2^2 + CE(\hat{r}_t, r_t) \big)}
+\end{align}
+where $sg(\cdot)$ is the stop-gradient operator and CE is the cross-entropy loss function. Reward prediction is formulated as a discrete regression problem in log-transformed space. Furthermore, $E_\vphi$ and $F_\vphi$ use SimNorm activation (Eq. \ref{eq:simnorm}) in their output layers. All trainable models are fully-connected MLPs with LayerNorm \citet{ba2016layer} and Mish activation \citet{misra2019mish}. The complete algorithm is shown in Algorithm \ref{alg:algo}. Further implementation details can be found in Appendix \ref{app:implementation-details}.
+
+\section{Experimental results} \label{sec:experimnets}
+
+\begin{figure}[t!]
+    \centering
+    \subfloat{\includegraphics[width=0.19\textwidth]{img/hopper.png}}
+    \hfill
+    \subfloat{\includegraphics[width=0.19\textwidth]{img/ant.png}}
+    \hfill
+    \subfloat{\includegraphics[width=0.19\textwidth]{img/anymal.png}}
+    \hfill
+    \subfloat{\includegraphics[width=0.19\textwidth]{img/humanoid.png}}
+    \hfill
+    \subfloat{\includegraphics[width=0.19\textwidth]{img/snuhumanoid.png}}
+    \caption{High-dimensional single-task environments (left to right): Hopper, Ant, Anymal, Humanoid and SNU Humanoid. Our method successfully learns tasks with up to $m=152$ continuous action dimensions. Additional 80 multi-task environments used in this paper are listed in Appendix~\ref{app:multi-task-app}}
+    \label{fig:envs_viz}
+\end{figure}
+
+\subsection{Contact-rich single tasks} \label{sec:experiments-single}
+
+The aim of this section is to understand whether smooth world models create better optimization landscapes than ground-truth dynamics, facilitating efficient FoG optimization. We study this on 5 continuous control tasks (Figure \ref{fig:envs_viz}) with up to $\mathcal{A} = \R^{152}$ using the differentiable simulator dflex \citet{xu2022accelerated}. Comparisons include SHAC \citet{xu2022accelerated}, which uses ground-truth dynamics and rewards with a similar actor-critic architecture to PWM. Furthermore, we compare against two world model approaches. DreamerV3 \citet{hafner2023mastering} learns its world model via reconstruction, its actor via ZoG optimization, and critic via Model-based Value Expansion (MVE) \citet{feinberg2018model}. TD-MPC2 \citet{hansen2023td} uses the same world model as PWM but learns a policy in a model-free fashion and actively plans at inference time. We additionally include model-free baselines PPO \citet{schulman2017proximal} and SAC \citet{haarnoja2018soft}. This comparison allows us to understand whether (1) FoG-based optimization can learn better policies asymptotically and (2) whether smooth world models induce better optimization landscapes for FoG optimization.
+
+\begin{figure}[b!]
+    \centering
+    \includegraphics[width=\textwidth]{img/dflex_results_agg.pdf}
+    \caption{\textbf{Aggregate results from high-dimensional locomotion tasks} where each agent is trained to solve just that task (i.e. specialist). The \textbf{left} figure summarizes rewards achieved at the end of training using 50\% IQM for the solid lines and 95\% CI as suggested by \citet{agarwal2021deep}, as well as mean for the dashed lines. We see that PWM achieves higher rewards than our main baselines TD-MPC2 and SHAC. The \textbf{right} figure shows score distributions across all tasks which lets us understand the performance variability of each approach.}
+    \label{fig:dflex-results}
+\end{figure}
+
+We conduct this experiment across 5 tasks with 10 seeds each, where PWM, DreamerV3, and TD-MPC2 use pre-trained world models and are left to learn a policy and fine-tune their world models online. This is done to enable a fair comparison to SHAC, which directly has access to the simulation model and does not require any training. The results in Figure \ref{fig:dflex-results} reveal that (1) PWM is able to learn policies with higher reward than SHAC asymptotically, indicating that regularized world models induce smoother optimization landscapes than the true (discontinuous) dynamics. Furthermore (2), despite using the same world model, our method is able to learn policies with higher rewards than TD-MPC2 without the need for online planning. However, PWM does not scale well to the highest-dimensional task. More experiment details and results are included in Appendix \ref{app:dflex-tasks}.
+
+
+\subsection{Multi-task world-model} \label{sec:experiments-mutli}
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.9\textwidth]{img/mutlitask_w_times.pdf}
+    \caption{\textbf{Multi-task results.} The \textbf{left} figure shows results of multi-task agents in the 30 and 80 task set settings which include environments from dm\_control \citet{tunyasuvunakool2020dm_control} and MetaWorld \citet{yu2020meta}. The results show 50\% IQM with the solid lines and mean with the dashed lines. The bars represent 95\% CI. In both settings PWM achieves higher reward than TD-MPC2 without the need for online planning. The \textbf{middle} figure compares the training and inference times of TD-MPC2 and PWM for the 48M parameter model. PWM has significantly lower inference time as it does not plan online. The \textbf{right} figure shows a comparison between multi-task PWM and TD-MPC2 and single-task experts SAC and DreamerV3 on the MT30 task set. Notably, PWM is able to match the performance of SAC and DreamerV3.}
+    \label{fig:multi-task-compare}
+\end{figure}
+
+We analyze the scalability of our proposed framework and method to large multi-task pre-trained world models. We evaluate on two settings: (1) 30 continuous control dm\_control tasks \citet{tunyasuvunakool2020dm_control} ranging from $m=1$ to $m=6$ and (2) 80 tasks, which include 50 additional manipulation tasks from MetaWorld \citet{yu2020meta} with $n=39$ and $m=4$. These two multi-task settings were introduced as \textit{MT30} and \textit{MT80} by \citet{hansen2023td}. In conducting our experiments, we harness the same data and world model architecture as TD-MPC2. The data consists of 120k and 40k trajectories per dm\_control and MetaWorld task, respectively generated by 3 random seeds of TD-MPC2 runs. The world models we use are the 48M parameter models introduced in \citet{hansen2023td} with slight modifications to make them differentiable (Appendix \ref{app:implementation-details}).
+
+To train PWM, we first pre-train the world models on the dataset in a similar fashion to TD-MPC2, but with training $H=16$ and $\gamma=0.99$ for better first-order gradients, as highlighted in Section \ref{sec:learning-chaos}. Then we train a PWM policy on each particular task using the offline datasets for 10k gradient steps, which take 9.3 minutes on an Nvidia RTX6000 GPU. We evaluate task performance for 10 seeds for each task and aggregate results in Figure \ref{fig:multi-task-compare}. We compare against TD-MPC2, which learns a multi-task policy while pre-training its world model and relies on online planning at inference. We can see that PWM learns behavior, achieving a higher reward than TD-MPC2 while also being significantly faster at inference time. While the fast per-task training is enabled by FoG optimization, we also find that training a single multi-task policy produces poor results, as shown in Appendix \ref{app:additional-ablations}. We further compare our multi-task PWM policy to online-trained single-task experts SAC \citet{haarnoja2018soft} and DreamerV3 \citet{hafner2023mastering}. Figure \ref{fig:multi-task-compare} reveals that multi-task PWM, while disadvantaged, performs comparably to the single-task experts without requiring any environment interaction and only training policies for $\leq$ 10 minutes per task. Additional results in Appendix \ref{app:multi-task-app}.
+
+\subsection{Ablations} \label{sec:ablations}
+
+\begin{figure}[t]
+    \centering
+    \subfloat[Contact stiffness ablation.]{\includegraphics[width=0.48\textwidth]{img/hopper_stiffness.pdf}\label{fig:contact-stiffness}}
+    \hfill
+    \subfloat[Policy batch size ablation.]{\includegraphics[width=0.48\textwidth]{img/batch_size_ablation.pdf}\label{fig:batch-size-abl}}
+    \caption{\textbf{Left figure shows contact stiffness ablation} where we increase contact stiffness on the Hopper task and analyze the effects on policy learning. The results indicate that stiff (but realistic) contact has adverse effects on SHAC which uses the simulation model to learn. Meanwhile, PPO and PWM remain unaffected with PWM still obtaining 17\% more reward than PPO asymptotically. The \textbf{right figure shows a policy batch size ablation} on the Any task where we vary only the batch size used to train the policy components of PWM. Unfortunately we observe that PWM provides best result within a unit of time by using small batch sizes. Both figures show 50\% IQM and 95\% CI over 5 random seeds.}
+\end{figure}
+
+\begin{figure}[t]
+    \centering
+    \subfloat[World model ablation.]{\includegraphics[width=0.59\textwidth]{img/world_model_ablation.pdf}\label{fig:world-model-abl}}
+    \hfill
+    \subfloat[World model vs policy sample efficiency.]{\includegraphics[width=0.4\textwidth]{img/learning_rate_abl.pdf}\label{fig:learnign-rate-abl}}
+    \caption{The \textbf{left figure ablates the activation functions} of the world model used to learn policies on the Ant task. We progressively add more regularization to the world model via changes to the activation function and observe an inverse correlation between world model loss and policy reward. This indicates that we should not construct world models for accuracy but for policy learning. The \textbf{right figure investigates the policy sample efficiency} on 5 dm\_control tasks. We use the same data to pre-train world models for varying amount of gradient steps and then train the policy for 50k gradient steps and compare against TD-MPC2 (without planning). The results indicate that PWM policies are significantly more sample efficient but also require better trained world models. All results shown are 50\% IQM with 95\% CI across 5 random seeds.}
+\end{figure}
+
+We perform 4 ablations on the complex single task experiments in order to understand the nuances of first-order optimization through world models with PWM.
+
+We increase the \textbf{contact stiffness} to be more realistic, but also more stiff contact gives gradients with high sample error \citet{suh2022differentiable}. We run the same experiment as Section \ref{sec:experiments-single}, but only for the Hopper task, and present the aggregate results from 5 random seeds in Figure \ref{fig:contact-stiffness}, where we normalize rewards by the maximum reward achieved by PPO in Section \ref{sec:experiments-single}. We see that while PPO and PWM rewards remain similar to prior results, SHAC performance decreases by 48\%. This shows that regularized world models are robust to stiff contact models and thus more generalizable than differentiable simulations.
+
+The \textbf{second ablation explores batch sizes} for policy learning with first-order gradients. Contrary to model-free methods, which can scale to large batch sizes, we find that FoG techniques like PWM benefit from smaller batch sizes. We explore this on the Ant task in Figure \ref{fig:batch-size-abl}, where we plot 50\% IQM rewards over 5 random seeds. While larger batch sizes allow us to generate more data within a unit of time, that does not necessarily translate to learning better policies.
+
+Next we \textbf{ablate the world model regularization}. We perform the same experiment as Section \ref{sec:experiments-single} on the Ant task but now pre-train 3 different world models. (1) with ReLU activation func., (2) with Mish activation func. and (3) with Mish activation func. and SimNorm activation func. at the output layers of $E_\phi$ and $F_\phi$. Figure \ref{fig:world-model-abl} reveals that while less regularization results in lower world model error, that does not translate to learning better policies. Surprisingly, less regularized world models enable policies to start faster (up to 1M steps) but plateau to a suboptimal policy. Additional results in Appendix \ref{app:additional-ablations}.
+
+To understand the \textbf{policy sample efficiency} of PWM while controlling for the world model, we perform an ablation where we pre-train the same world model for [50k, 100k, 250k] gradient steps on an offline dataset. Then we fix the world model and train only the policy components on the same dataset for 50k gradient steps and measure the reward. We do this for 3 random seeds and 5 dm\_control tasks. We repeat the same experiment for TD-MPC2 but disable its planning component in order to understand the learning dynamics of each method's policy components. The results in Figure \ref{fig:learnign-rate-abl} show that the PWM policy components are significantly more sample efficient than TD-MPC2 but also require better trained world models in order to obtain high reward.
+
+\section{Related work}
+
+\textbf{Reinforcement learning (RL)} strategies are divided into model-based and model-free approaches, with the latter not assuming a model of the environment \citet{arulkumaran2017deep}. Model-free approaches, such as PPO \citet{schulman2017proximal} and SAC \citet{haarnoja2018soft} do not require a model of the environment and represent on-policy and off-policy methods, respectively. These algorithms use an actor-critic structure, where the critic assesses the policy while the actor updates it through gradient-based optimization to maximize rewards \citet{konda1999actor}.
+
+\textbf{Gradient estimator types}. In the absence of direct access to dynamics and reward functions, it is common to use the Policy Gradient Theorem \citet{sutton1999policy}, a zeroth-order method, to estimate gradients. Although robust to discontinuities, this method exhibits high variance, leading to sample inefficiency \citet{mohamed2020monte}. In contrast, first-order gradients (FoG) offer lower variance by differentiating through the objective but struggle with discontinuities \citet{suh2022differentiable}. Differentiable simulations have risen as a tool to study the properties of gradient estimators \citet{howell2022dojo,metz2021gradients} and have produced model-based algorithms that use FoG optimization through physics to learn high-performing policies \citet{xu2022accelerated,georgiev2024adaptive}.
+
+\textbf{Multi-task models.} While traditional RL focuses on single-task policies, the broader robotics field is increasingly adopting large multi-task models through behavior cloning \citet{firoozi2023foundation}. Recent efforts like Open X \citet{padalkar2023open} and Octo \citet{team2023octo} have demonstrated improved performance across various tasks and embodiments by leveraging large models and datasets. However, the potential of these large-scale approaches in RL remains largely unexplored. While GATO \citet{reed2022generalist} attempted to scale model-free RL across multiple tasks, it faced challenges with sample inefficiency and required significant fine-tuning. Conversely, TD-MPC2 \citet{hansen2023td} successfully scaled a 317M parameter world model for online planning across 80 tasks. While showing impressive multi-task scalability, it failed to solve all tasks and exhibits limited scalability due to online planning. Our work builds on the world model architecture proposed by TD-MPC2 but employs FoG optimization for policy learning and extracts per-tasks policies. DreamerV3 \citet{hafner2023mastering} also integrates world models with FoG but focuses on online learning without addressing multi-task scenarios. Our work delves deeper into the relationship between world models and policy learning, exploring the essential characteristics of world models that facilitate efficient optimization.
+
+\section{Conclusion} \label{sec:conclusion}
+% \vspace{-1cm}
+
+% In this work, we introduced Policy learning with multi-task World Models (PWM), a novel MBRL approach that utilizes world models effectively as a differentiable simulator for efficient policy training using First-order Gradients (FoG). Our evaluations demonstrated that PWM can learn policies with higher rewards than existing methods, even if they have access to simulation ground-truth models. Furthermore, the PWM framework paves a pathway to scalibly learn high-performing policies from large multi-task world models, achieving higher rewards than our main baseline TD-MPC2 without the need for online planning.
+
+% In this work, we analyzing world models through the lens of policy gradient estimation, we find an inverse correlation between world models accuracy and episode reward. We conclude that instead of building world models for accuracy, we should build them for smoothness and lower optimality gap, resulting in better policy performance. Building on these insights, we propose Policy learning through mulit-task World Models (PWM), a MBRL algorithm which couples smooth world models with efficient First-order Gradient (FoG) optimization. Our evaluations demonstrated that on single high-dimensional tasks, PWM can learn policies with higher rewards than existing methods, even ones that have access to ground-truth simulation dynamics. To scale efficiently to a multi-task setting, we propose a new framework where world models are learned offline and treated as differentiable simulations. Then we showed that PWM can be used to learn expert policies in <10 minutes per task, achieving higher rewards without the need for expensive online planning. Given sufficient data and large smooth world models, we believe this framework offers a pathway to scalability.
+
+In this study, we analyzed world models through policy gradient estimation and identified an inverse correlation between the accuracy of world models and episode rewards. We concluded that world models should prioritize smoothness and a smaller optimality gap over accuracy to enhance policy performance. Building on these insights, we propose Policy learning through Multi-task World Models (PWM), a MBRL algorithm that integrates smooth world models with first-order gradient (FoG) optimization. Our evaluations showed that PWM can outperform existing methods, including those with access to ground-truth simulation dynamics, in learning high-reward policies for high-dimensional tasks. To scale to a multi-task settings, we propose a framework where world models are pre-trained offline and treated as differentiable simulations. Our results demonstrate that PWM can be used to learn expert policies in <10 minutes per task, achieving higher rewards without the need for expensive online planning. With ample data and large, smooth world models, we believe this approach has significant potential for scalability.
+
+\textbf{Limitations.} Despite its demonstrated efficacy, PWM has notable limitations. Firstly, performance relies heavily on the availability of substantial pre-existing data to train the world model, which might not always be feasible, especially in novel or low-data environments. Secondly, although PWM facilitates fast and cost-effective policy training, it necessitates re-training for each new task, which could limit its applicability in scenarios requiring rapid adaptation to diverse tasks. Lastly, the current TD-MPC2 world models used are difficult to train at scale due to their auto-regressive formulation.
+
+\newpage
+\textbf{Reproducibility statement.} Code, training data and checkpoints are made available at \href{https://policy-world-model.github.io}{\texttt{policy-world-model.github.io}}. We rely on dflex, MetaWorld, DMControl and MuJoCo for simulation which are publicly available under MIT and Apache 2.0 licenses. We use multi-task data from TD-MPC2 which is publicly available. Implementation details and full list of hyper-parameters are available in Appendix \ref{app:implementation-details}.
+\bibliography{iclr2025_conference}
+\bibliographystyle{iclr2025_conference}
+
+\newpage
+\input{appendix}
+
+
+\end{document}

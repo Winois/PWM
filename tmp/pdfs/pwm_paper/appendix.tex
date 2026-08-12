@@ -1,0 +1,333 @@
+\newpage
+\appendix
+
+\section{Ball-wall example details} \label{app:ball-wall}
+
+This section provides more details on the ball-wall example used to showcase the issues of optimizing through contact in Section \ref{sec:learning-through-contact}. In constructing this toy example we chose a simple physical system that exhibits contact discontinuities. Inspired by Suh et al. \citep{suh2022differentiable}, we constructed a simple problem of a point mass (ball) being thrown forward (x direction) at a fixed velocity $v$. The optimization parameter of interest is the initial angle $\theta$ and the goal is to maximize forward distance traveled (in 2D). For simplicity we assume that the ball sticks to the wall (without complex contact) which can be expressed as:
+\begin{equation} \label{eq:ball-wall}
+    J(\theta) = x_t = f(\theta) = \begin{cases}
+        x_0 + v \cos(\theta) t + \dfrac{1}{2} g t^2 & \text{if } y_{\text{contact}} > h \\
+        w & else
+    \end{cases}
+\end{equation}
+where $g=9.81$ is gravity, $h$ and $w$ are the height and width of the wall, $(x_0, y_0)$ is the starting position, $v=10$ is the starting velocity and $t=2$ is time. $y_\text{contact}$ is the height at the time of contact $t_\text{contact}$ which are both given by solving Eq. \ref{eq:ball-wall} for $f(\theta)=w$:
+\begin{align*}
+    t_\text{contact} = \dfrac{-v cos(\theta) + \sqrt{v^2 \cos^2(\theta) + a w}}{a} &&
+    y_\text{contact} = y_0 + v\sin(\theta) t + \dfrac{1}{2} g t^2
+\end{align*}
+
+\begin{wrapfigure}{R}{14em}
+  \includegraphics[width=0.8\linewidth]{img/ball-wall-4.pdf}
+  \caption{Pedagogical ball-wall toy problem visualized.}
+  \label{fig:ball-wall-drawin}
+\end{wrapfigure}
+
+We visualize the toy example in Figure \ref{fig:ball-wall-drawin} to aid reading. With $f(\theta)$ defined, we attempt to learn it with two Multi-Layer Perceptrons (MLPs). We configure them to have 2 hidden layers of 32 neurons each. The first MLP uses ReLU activation functions, while the latter uses SimNorm activation functions as defined in Eq. \ref{eq:simnorm}. Both models are initialized with identical random parameters and are trained with the ADAM optimizer with learning rate $\alpha=2 \times 10^{-3}$ for 100 epochs using a batch size of $B=50$. The data we use to train the models was 1000 uniform samples of $f(\theta)$ within $\theta \in [-\pi, \pi]$. Figure \ref{fig:ball-wall-extended} shows the training losses of the models, induced optimization landscapes and the losses when attempting to maximize the models as you would do in an RL setting. 
+
+\begin{figure*}
+     \centering
+     \subfloat{\includegraphics[width=0.32\textwidth]{img/ball_wall_losses.pdf}\label{fig:ball-wall-losses}}
+     \hfill
+     \subfloat{\includegraphics[width=0.32\textwidth]{img/ball_wall_clean.pdf}\label{fig:ball-wall-landscape}}
+     \hfill
+    \subfloat{\includegraphics[width=0.32\textwidth]{img/ball_wall_opt.pdf}\label{fig:ball-wall-opt}}
+    \caption{\textbf{Extended ball-wall toy example results.} The \textbf{left} figure shows the model losses as they are trained to approximate the target function $J(\theta)$. The middle figure shows the output of the trained model across the spectrum of $\theta$ as well as the true target. This is the function we attempt to minimize in the \textbf{right} figure. We can see that when using the MLP with ReLU activation functions, the optimizer quickly gets stuck in local minima while the model using SimNorm activation function is able to find a solution closer to the true one.}
+    \label{fig:ball-wall-extended}
+\end{figure*}
+
+\newpage
+\section{Double pendulum example details} \label{app:double-pendulum}
+
+The double pendulum (also known as Acrobot \citep{murray1991case}) is a classic under-actuated chaotic system. It is characterized by its sensitivity to initial conditions where even small perturbations result in large gradient variance with long horizon ($>20$) trajectories. We chose this system to analyze variance and expected signal-to-noise ratio (ENSR) in Section \ref{sec:learning-chaos} as it is the easiest problem exhibiting chaosness. We model this toy problem similar to DMControl \citep{tunyasuvunakool2020dm_control} in our differentiable simulator, dflex as we need ground truth gradients for comparison. The first link with angle $\theta_1$ is fixed to the base and not actuated. The second link with angle $\theta_2$ is the only control input via $\dot{\theta}_2$. The state of the system id calculated as:
+\begin{align*}
+    \vs = [\cos(\theta_1), \sin(\theta_1), \cos(\theta_2), \sin(\theta_2), \dot{\theta}_1, \dot{\theta}_2]
+\end{align*}
+The objective of this toy example is to bring and balance the pendulum upwards which we achieve by formulating a reward:
+\begin{align*}
+    r(\vs, \va) = -\theta_1^2 -\theta_2^2 - 0.1 \dot{\theta}_2^2 
+\end{align*}
+Next we train world models to approximate the dynamics and reward above. For this we collect data with the SHAC algorithm \citep{xu2022accelerated} over 3 different runs for a total of 24,000 episodes of length 240 timesteps. Maximum episode reward achieved during data collection was -942.95. Then we train two TDMPC2 \citep{hansen2023td} world models on the collected data. We use the 5M parameter model which features a latent state of dimension of 512, encoder $E_\vphi$ with one hidden dimension of 256, dynamics model MLP with 2 hidden layers with 512 neurons and a rewards model of the same design. We keep the same hyper-parameters as per the origin work by Hensen et al. but use $\gamma = 0.99$ which we found to reduce variance substantially. We train two models with different training horizons $H=3$ and $H=16$ for 100k batch samples and a batch size of 1024.
+
+With the trained models, we now compare the variance of stochastic gradients provided by the true dynamics of the simulation and the two trained models. We do this by loading the best policy learned by SHAC during data collection and executing a $H=50$ rollout across the 3 models. We ensure that the same actions are taken for each evaluated models and collect 100 Monte Carlo samples. In addition to variance, we report ESNR as suggested by \citep{parmas2023model} and defined in \ref{eq:esnr}. Higher ESNR translate to more useful gradients and we naturally should expect values to decrease with increased $H$. We reported the results in Figure \ref{fig:double-pendulum} but also duplicate them in Figure \ref{fig:double-pendulum-app} for convenience and ease of reading.
+
+\begin{figure*}
+     \centering
+     \subfloat{\includegraphics[width=0.1\textwidth]{img/double-pendulum-1.pdf}}
+     \hfill
+     \subfloat{\includegraphics[width=0.8\textwidth]{img/sensitivity.pdf}}
+    \caption{\textbf{Double pendulum pedagogical example.} The middle figure evaluates the variance of policy gradient estimates over $N=100$ Monte-Carlo samples for varying horizons $H$. The right figure shows the same data but plots the Expected Signal-to-Noise ratio (ESNR) with higher values translating to more useful gradients. These results suggests that world models trained over long horizon trajectories provide more useful gradients.}
+    \label{fig:double-pendulum-app}
+\end{figure*}
+
+\newpage
+\section{Implementation details and hyper-parameters} \label{app:implementation-details}
+
+The section details several implementation details of PWM that we thought are not crucial for understanding the proposed approach in Section \ref{sec:method} but are important for replicating the results.
+\begin{enumerate}
+    \item \textbf{Reward binning} - the reward model we use in PWM is formulated as a discrete regression problem where $\R$ rewards are discretized into a predefined number of bins. Similar to \citep{hansen2023td,lee2023differentiable}, we do this to enable robustness to reward scale and multi-task-ness. In particular, we perform two-hot encoding using SymLog and SymExp operators which are mathematically defined as:
+    \begin{align*}
+        \operatorname{SymLog}(x) = \operatorname{sign}(x) \log(1+|x|) && \operatorname{SymExp}(x)= \operatorname{sign}(x) (e^{|x|} - 1) 
+    \end{align*}
+    Two-hot encoding is then performed with:
+    \begin{python}
+        def two_hot(x):
+            x = clamp(symlog(x), vmin, vmax)
+            bin_idx = floor((x - vmin) / bin_size)
+            bin_offset = (x - vmin) / bin_size - bin_idx
+            soft_two_hot = zeros(x.size(0), num_bins)
+            soft_two_hot[bin_idx] = 1 - bin_offset
+            soft_two_hot[bin_odx + 1] = bin_offset
+            return soft_two_hot
+    \end{python}
+    Inverting this operation to get back to scalar rewards would usually involve SymExp$(x)$ but note that the sign$(x)$ operator is not differentiable and would therefore not work for FoG. Instead, we chose to omit the SymExp$(x)$ operation which technically now returns pseudo-rewards but also gradients which we found sufficient for policy learning:
+    \begin{python}
+        def two_hot_inversion(x):
+            vals = linspace(vmin, vmax, num_bins)
+            x = softmax(x)
+            x = torch.sum(x * vals, dim=-1)
+            return x
+    \end{python}
+
+    \item \textbf{Critic training} - while Algorithm \ref{alg:algo} function to similar results as presented in \ref{sec:experimnets}, we found it beneficial to split the critic training data from a single rollout into several smaller mini-batches and over them for multiple gradient steps. In our implementation we split the data into 4 mini-batches and perform 8 gradient steps over them with uniform sampling. With a $H=16$ and batch size 64, this translates to a critic batch size of 256.
+    \item \textbf{Minimum policy noise} - Due to the larger amount of gradient steps needed, we noticed that PWM's actor tends to collapse to a deterministic policy rapidly. As such, we found it beneficial to include a lower bound on the standard deviation of the action distribution in order to maintain stochasticity in the optimization process. We have used $0.24$ throughout this paper. While similar results would be possible by adding an entropy term \citep{schulman2017proximal}, we found our current solution sufficient
+    \item \textbf{World model fine-tuning} - Throughout all of our experiments we found that the offline data used to train PWM's world model to be crucial to learning a good policy. In very high-dimensional tasks such as Humanoid SNU, collecting extensive data is a difficult task. As such, in these tasks we found it beneficial to online fine-tune the world model. We do this on all single-task experiments of Section \ref{sec:experiments-single} using the default hyper-parameters and a replay buffer of size 1024.
+    
+\end{enumerate}
+
+\begin{table}[h]
+\centering
+\begin{NiceTabular}{ll}
+\CodeBefore
+  \rowcolor[HTML]{D6D6EB}{1}
+  \rowcolors[HTML]{2}{eaeaf3}{FFFFFF} % seaborn colors
+  % \rowcolors{2}{gray!15}{white}
+\Body
+\toprule
+Hyper-parameter         & Value    \\ \midrule
+\textbf{Policy components} \\
+Horizon ($H$)           & $16$ \\
+Batch size              & $64$ \\
+$\alpha_\vtheta$        & $5 \times 10^{-4}$ \\
+$\alpha_\vpsi$          & $5 \times 10^{-4}$ \\
+Actor grad norm         & $1$ \\
+Critic grad norm        & $100$ \\
+Actor hidden layers     & $[400, 200, 100]$ \\
+Critic hidden layers    & $[400, 200]$ \\
+Number of critics       & 3 \\
+$\lambda$               & 0.95  \\ 
+$\gamma$                & 0.99 \\
+Critic batch split      & 4 \\
+Critic iterations       & 8 \\
+\textbf{World model components (48M)} \\
+Latent state ($\vz$) dimension & 768 \\
+Horizon ($H$)           & $16$ \\
+Batch size              & $1024$ \\
+$\alpha_\vphi$          & $3 \times 10^{-4}$ \\
+World model grad norm   & 20.0 \\
+SimNorm $V$             & 8 \\
+Reward bins             & 101 \\
+Encoder $E_\vphi$ hidden layers   & $[1792, 1792, 1792]$ \\
+Dynamics $F_\vphi$ hidden layers  & $[1792, 1792]$ \\
+Reward  $R_\vphi$ hidden layers  & $[1792, 1792]$ \\
+Task encoding dimension & 96 \\ \bottomrule
+\end{NiceTabular}
+\caption{Table of hyper-parameters used in PWM, shared across all tasks.}
+\label{tab:common-hyperparamters}
+\end{table}
+
+\newpage
+\section{Contact-rich single task experiment details} \label{app:dflex-tasks}
+
+In Section \ref{sec:experiments-single}, we explore 5 locomotion tasks with increasing complexity. They are described below and shown in Figure \ref{fig:envs_viz}.
+
+\begin{enumerate}[wide, labelwidth=0pt, labelindent=0pt, topsep=0pt,itemsep=0pt, partopsep=1ex,parsep=1ex] 
+    \item \textbf{Hopper}, a single-legged robot jumping only in one axis with $n=11$ and $m=3$.
+    \item \textbf{Ant}, a four-legged robot with $n=37$ and $m=8$.
+    \item \textbf{Anymal}, a more sophisticated quadruped with $n=49$ and $m=12$ modeled after \citep{hutter2016anymal}. 
+    \item \textbf{Humanoid}, a classic contact-rich environment with $n=76$ and $m=21$ which requires extensive exploration to find a good policy.
+    \item \textbf{SNU Humanoid}, a version of Humanoid lower body where instead of joint torque control, the robot is controlled via $m=152$ muscles intended to challenge the scaling capabilities of algorithms.
+\end{enumerate}
+
+\begin{figure}
+    \centering
+    \subfloat{\includegraphics[width=0.19\textwidth]{img/hopper.png}}
+    \hfill
+    \subfloat{\includegraphics[width=0.19\textwidth]{img/ant.png}}
+    \hfill
+    \subfloat{\includegraphics[width=0.19\textwidth]{img/anymal.png}}
+    \hfill
+    \subfloat{\includegraphics[width=0.19\textwidth]{img/humanoid.png}}
+    \hfill
+    \subfloat{\includegraphics[width=0.19\textwidth]{img/snuhumanoid.png}}
+    \caption{Locomotion environments (left to right): Hopper, Ant, Anymal, Humanoid and SNU Humanoid.}
+    \label{fig:envs_viz-app}
+\end{figure}
+
+\begin{figure}
+    \centering
+    \includegraphics[width=\textwidth]{img/locomotion_sweep.pdf}
+    \caption{\textbf{Learning curves for each environment}. This figure shows 50\% IQM and 95\% CI across 10 random seeds for each task in the dflex simulation suite. Rewards are normalized by the maximum reward achieved by PPO (usually $\geq$ 100M steps). While PWM remains competitive with SHAC for most tasks, it does not scale well to the 152 action dimension SNU Humanoid. Note that SHAC uses gradients from the differentiable simulation directly and converges in fewer samples, explaining the truncated curves.}
+    \label{fig:full-locomotion-results}
+\end{figure}
+
+All tasks share the same common main objective - maximize forward velocity $v_x$:
+
+\begin{table}[h]
+\centering
+\begin{NiceTabular}{ll}
+\CodeBefore
+  \rowcolor[HTML]{D6D6EB}{1}
+  \rowcolors[HTML]{2}{eaeaf3}{FFFFFF} % seaborn colors
+  % \rowcolors{2}{gray!15}{white}
+\Body
+\toprule
+Environment & Reward    \\ \midrule
+Hopper & $v_x + R_{height} + R_{angle} - 0.1\| \va \|^2_2$ \\
+Ant & $v_x + R_{height} + 0.1 R_{angle} + R_{heading} - 0.01\| \va \|^2_2$ \\
+Anymal & $v_x + R_{height} + 0.1 R_{angle} + R_{heading} - 0.01\| \va \|^2_2$ \\
+Humanoid & $v_x + R_{height} + 0.1 R_{angle} + R_{heading} - 0.002\| \va \|^2_2$ \\
+Humanoid STU & $v_x + R_{height} + 0.1 R_{angle} + R_{heading} - 0.002\| \va \|^2_2$ \\
+\bottomrule
+\end{NiceTabular}
+\caption{Rewards used for each task bench-marked in Section \ref{sec:experimnets}}
+\label{tab:rewards}
+\end{table}
+We additionally use auxiliary rewards $R_{height}$ to incentivise the agent to, $R_{angle}$ to keep the agents' normal vector point up, $R_{heading}$ to keep the agent's heading pointing towards the direction of running and a norm over the actions to incentivise energy-efficient policies. For most algorithms, none of these rewards apart from the last one are crucial to succeed in the task. However, all of them aid learning policies faster.
+
+\begin{align*}
+    R_{height} = \begin{cases}
+        h - h_{term} & if h \geq h_{term} \\
+        -200 (h - h_{term})^2 & if h < h_{term} 
+    \end{cases}
+\end{align*}
+
+\begin{align*}
+    R_{angle} = 1 - \bigg( \dfrac{\theta}{\theta_{term}} \bigg)^2
+\end{align*}
+
+$R_{angle} = \| \vq_{forward} - \vq_{agent} \|_2^2$ is the difference between the heading of the agent $\vq_{agent}$ and the forward vector $\vq_{agent}$. $h$ is the height of the CoM of the agent and $\theta$ is the angle of its normal vector. $h_{term}$ and $\theta_{term}$ are parameters that we set for each environment depending on the robot morphology. Similar to other high-performance RL applications in simulation, we find it crucial to terminate episode early if the agent exceeds these termination parameters. However, it is worth noting that AHAC is still capable of solving all tasks described in the paper without these termination conditions, albeit slower.
+
+All results presented in Figure \ref{fig:full-locomotion-results} are for 10 random seeds using the simulator in a vectorized fashion with 64 parallel environments for all approaches, except PPO which uses 1024. We note that while simulation steps appear high, all of these experiments are executed $\leq 2$ hours on an Nvidia RTX6000 GPU. In addition the the learning curves of Figure \ref{fig:full-locomotion-results}, we also present tabular results below:
+
+\begin{table}[h]
+\centering
+\begin{NiceTabular}{cccccc}
+\CodeBefore
+  \rowcolor[HTML]{D6D6EB}{1}
+  \rowcolors[HTML]{2}{eaeaf3}{FFFFFF} % seaborn colors
+\Body
+\toprule
+     & Hopper      & Ant         & Anymal      & Humanoid    & SNU Humanoid \\ \midrule
+PPO  & $1.00 \pm 0.11$ & $1.00 \pm 0.12$ & $1.00 \pm 0.03$ & $1.00 \pm 0.05$ & $1.00 \pm 0.09$   \\ 
+SAC  & $0.87 \pm 0.16$ & $0.95 \pm 0.08$ & $0.98 \pm 0.06$ & $1.04 \pm 0.04$ & $0.88 \pm 0.11$  \\ \midrule
+DreamerV3 & $1.15 \pm 0.47$ & $1.12 \pm 0.45$ & $1.18 \pm 0.47$ & $1.03 \pm 0.43$ & $0.48 \pm 0.21$  \\ 
+TDMPC2 & $0.85 \pm 0.37$ & $1.07 \pm 0.44$ & $0.98 \pm 0.48$ & $1.05 \pm 0.46$ & $0.26 \pm 0.12$  \\ \midrule
+SHAC & $1.02 \pm 0.03$ & $1.16 \pm 0.13$ & $1.26 \pm 0.04$ & $1.15 \pm 0.04$ & $1.44 \pm 0.08$ \\ 
+PWM & $1.20 \pm  0.29$ & $1.46 \pm 0.31$ & $1.16 \pm 0.24$ & $1.19 \pm 0.025$ & $1.36 \pm 0.56$  \\ \bottomrule
+\end{NiceTabular}
+\caption{Tabular results of the asymptotic (end of training) rewards achieved by each algorithm across all tasks. The results presented are PPO-normalised 50 \% IQM and standard deviation across 10 random seeds. Most algorithms have been trained until convergence.}
+\label{tab:results}
+\end{table}
+
+% perf_scales
+% {'ant': 6604.663357204862,
+%  'hopper': 4742.296956380208,
+%  'anymal': 12028.991672092014,
+%  'humanoid': 7292.7856852213545,
+%  'humanoidsnu': 4114.013700544121}
+
+\begin{table}[h]
+\centering
+\begin{NiceTabular}{cccccc}
+\CodeBefore
+  \rowcolor[HTML]{D6D6EB}{1}
+  \rowcolors[HTML]{2}{eaeaf3}{FFFFFF} % seaborn colors
+\Body
+\toprule
+     & Hopper      & Ant         & Anymal      & Humanoid    & SNU Humanoid \\ \midrule
+PPO  & $4742 \pm 521$ & $6605 \pm 793$ & $12029 \pm 360$ & $7293 \pm 365$ & $4114 \pm 370$   \\ 
+SAC  & $4126 \pm 759$ & $6275 \pm 528$ & $11788 \pm 722$ & $7285 \pm 292$ & $3620 \pm 453$  \\ \midrule
+DreamerV3  & $5436 \pm 2213 $ & $7370 \pm 3002$ & $14169 \pm 5692$ & $7546 \pm 3106$ & $2018 \pm 873$  \\
+TDMPC2  & $4027 \pm 1768 $ & $7080 \pm 2885$ & $11787 \pm 4702$ & $7634 \pm 3317$ & $1121 \pm 525$  \\ \midrule
+SHAC & $4837 \pm 142$ & $7662 \pm 859$ & $15157 \pm 481$ & $8387 \pm 292$ & $5924 \pm 329$ \\ 
+PWM & $5680 \pm  2303$ & $9672 \pm 2012$ & $13927 \pm 2882$ & $8661 \pm 1792$ & $5767 \pm 2394$  \\ \bottomrule
+\end{NiceTabular}
+\caption{Tabular results of the asymptotic (end of training) rewards achieved by each algorithm across all tasks. The results presented are 50 \% IQM and standard deviation across 10 random seeds. All algorithms have been trained until convergence.}
+\label{tab:results_raw}
+\end{table}
+
+We note that TDMPC2 and PWM use pre-trained world models on 20480 episodes of each task. The world models are trained for 100k gradient steps and the same world models (specific to each task) are loaded into both approaches. The data consists of trajectories of varying policy quality generated with the SHAC algorithm. Trajectories include near-0 episode rewards as well as the highest reward achieved by SHAC. Note that we also run an early termination mechanism in these tasks which is done to accelerate learning and iteration.
+
+\section{Multi-task experiments additional results} \label{app:multi-task-app}
+
+In this section we provide additional results on multi-task experiments. While we find it beneficial to train the world model at the same horizon as the policy learning, it is not strictly necessary to achieve good performance. In Figure \ref{fig:horizon-ablation} we present an ablation where we compare PWM world models pre-trained on horizons $H=3$ and $H=16$ and policies trained only with $H=16$. These results reveal that $H=16$ trained world models have only marginally higher scores. On deeper inspection, most of increased scores come form dm\_control tasks which are harder than MetaWorld tasks on average. Therefore if training new world models, we advise using higher $H$; however if other pre-trained world models exist with suboptimal $H$, they will probably be also useful. 
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.6\textwidth]{img/horizon_ablation.pdf}
+    \caption{Horizon ablation of the world model}
+    \label{fig:horizon-ablation}
+\end{figure}
+
+Figures \ref{fig:mt30-individual} and \ref{fig:mt80-individual} give scores for individual tasks for TDMPC2 and PWM across both the MT30 and MT80 task sets. We can observe that most of the increased performance of PWM is in dm\_control tasks which are on average more difficult than MetaWorld.  
+
+
+
+\begin{figure}
+    \centering
+    \includegraphics[width=0.6\textwidth]{img/mt30_individual.pdf}
+    \caption{Individual task results for MT30 task set.}
+    \label{fig:mt30-individual}
+\end{figure}
+
+\begin{figure}[h!]
+    \centering
+    \subfloat{\includegraphics[width=0.52\textwidth]{img/mt80_individual_1.pdf}}
+    \hfill
+    \subfloat{\includegraphics[width=0.48\textwidth]{img/mt80_individual_2.pdf}}
+    \caption{Individual task results for MT80 task set.}
+    \label{fig:mt80-individual}
+\end{figure}
+
+\newpage
+\section{Additional ablation results} \label{app:additional-ablations}
+
+\subsection{World model regularization ablation}
+
+We extend our world model regularization ablation from Section \ref{sec:ablations} to 3 additional dflex locomotion tasks - Hopper, Anymal and Humanoid. The complete results are presented in Figure \ref{fig:add-world-model-abl} and follow the same format as the original results in Figure \ref{fig:world-model-abl} - 50\% IQM with 95\% CI across 3 seeds. From the results we can observe that progressively adding more regularization, results in higher policy rewards. This follows the ablation results in our paper and the one of the core contribution of work - more accurate world models, do not results in better rewards. Instead of building world models for accuracy, we should build them to enable better policy optimization and thus higher rewards.
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=1.0\linewidth]{img/world_model_ablation_2.pdf}
+    \caption{\textbf{World model regularization ablation.} This figure extends the ablation results of Figure \ref{fig:world-model-abl} with additional tasks. The figure shows 50 \% IQM with 95\% CI over 5 seeds per task.}
+    \label{fig:add-world-model-abl}
+\end{figure}
+
+\subsection{Training a multi-task policy}
+
+One of the contributions of our work is the multi-task learning framework of PWM. Instead of training a single multi-task policy, we propose training a single multi-task world model with a supervised objective and then extracting RL policies from it very efficiently. In this section we justify this empirically by reproducing the MT30 experiment of Section \ref{sec:experiments-mutli} with two additional baselines - TD-MPC2 without planning and PWM with a single multi-task policy. This strips down both algorithms to be very similar, the major difference being that TD-MPC2 features an off-policy SAC-like policy while PWM features an on-policy SHAC-like policy. Both are fed the same one-hot task embeddings. The results in \ref{fig:framework-ablation} show that both fail at solving the MT30 benchmark. In the case of TD-MPC2, this reveals its reliance on planning and in the case of PWM, this reveals the need to train policies per-task. We believe this is due to the unstable optimization objective of the RL problem.  
+
+% \begin{figure}[h]
+%     \centering
+%     \includegraphics[width=0.5\linewidth]{img/framework_ablation.pdf}
+%     \caption{Framework ablation ablation. Extends the results of Figure \ref{fig:multi-task-compare} with two additional baselines: TD-MPC2 without planning and PWM with a single multi-task policy learned over all embeddings. The figure shows 50\% IQM results with solid lines, mean with dashed lines and 95 \% CI.}
+%     \label{fig:framework-ablation}
+% \end{figure}
+
+\begin{wrapfigure}{R}{19em}
+    \includegraphics[width=\linewidth]{img/framework_ablation.pdf}
+    \caption{Framework ablation ablation. Extends the results of Figure \ref{fig:multi-task-compare} with two additional baselines: TD-MPC2 without planning and PWM with a single multi-task policy learned over all embeddings. The figure shows 50\% IQM results with solid lines, mean with dashed lines and 95 \% CI.}
+    \label{fig:framework-ablation}
+\end{wrapfigure}
+
+\subsection{TD(\texorpdfstring{$\lambda$}{lambda}) ablation}
+
+Here we replace the actor objective of PWM with TD($\lambda$) similar to Dreamer \citep{hafner2019dream}. We evaluate this on 3 single-task experiments - Hopper, Ant and Anymal and show the results in \ref{fig:td-lambda-abl}. We can see that PWM overall achieves higher rewards, which we believe is to more simple and less noisy gradients obtained via TD(N). Additionally, we found that TD($\lambda$) uses approx. 10\% more computation due to having to compute more gradients. However, it is worth noting that TD($\lambda$) learning curves appear more stable with higher dimensional tasks such as Anymal and we believe this ablation requires more large-scale studying.
+
+\begin{figure}
+    \centering
+    \includegraphics[width=\linewidth]{img/td_lambda_abl.pdf}
+    \caption{TD($\lambda$) ablation. This figure compares vanilla PWM with a version that uses a TD($\lambda$) actor objective. Results shown are 50\% IQM with 95\% CI over 3 seeds.}
+    \label{fig:td-lambda-abl}
+\end{figure}
+

@@ -160,6 +160,12 @@ class PWM:
             action_dim=self.latent_action_dim,
         ).to(self.device)
 
+        # ensure actor output dimensionality matches JSAE latent action dim
+        if self.jsae is not None:
+            if getattr(self.actor, "action_dim", None) != self.jsae.latent_action_dim:
+                raise ValueError(
+                    "actor output dim must match jsae latent_action_dim"
+                )
         critics = [
             instantiate(
                 critic_config,
@@ -291,6 +297,12 @@ class PWM:
         policy_output = torch.tanh(
             self.actor(actor_input, deterministic=deterministic)
         )
+        # policy_output is latent action when JSAE is present; ensure dims
+        if self.jsae is not None:
+            if policy_output.shape[-1] != self.latent_action_dim:
+                raise ValueError(
+                    f"actor produced latent-action dim {policy_output.shape[-1]} != expected {self.latent_action_dim}"
+                )
         if self.jsae is None:
             return policy_output
 
@@ -1026,13 +1038,18 @@ class PWM:
         jae_loss = None
         if self.jsae is not None:
             # Learn the latent action representation without updating the world model.
+            # Align time dimensions: states correspond to obs[:-1] and actions to act[:-1].
             self.jsae_optimizer.zero_grad()
             with torch.no_grad():
                 states = self.wm.encode(obs[:-1], task)
-            reconstructed_act, _ = self.jsae(states, act)
-            action_mask = self._action_mask(act, task)
-            squared_error = (reconstructed_act - act) ** 2 * action_mask
-            jae_loss = squared_error.sum() / action_mask.sum()
+            # use actions aligned with states
+            actions_for_jae = act[:-1]
+            reconstructed_act, _ = self.jsae(states, actions_for_jae)
+            action_mask = self._action_mask(actions_for_jae, task)
+            squared_error = (reconstructed_act - actions_for_jae) ** 2 * action_mask
+            # avoid division by zero if mask is all zero; clamp denominator
+            denom = action_mask.sum().clamp_min(1.0)
+            jae_loss = squared_error.sum() / denom
             jae_loss.backward()
             self.jsae_optimizer.step()
 
