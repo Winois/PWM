@@ -42,6 +42,7 @@ class PWM:
         obs_dim: int,
         act_dim: int,
         jsae_config: Optional[DictConfig] = None,
+        jae_loss_denom_min: float = 1.0,
         actor_grad_norm: Optional[float] = None,  # clip grad norms during training
         critic_grad_norm: Optional[float] = None,  # clip grad norms during training
         num_critics: int = 3,  # for critic ensembling
@@ -101,6 +102,7 @@ class PWM:
         self.critic_lr = critic_lr
         self.model_lr = model_lr
         self.jsae_lr = jsae_lr
+        self.jae_loss_denom_min = jae_loss_denom_min
         self.lr_schedule = lr_schedule
         self.gamma = gamma
         self.lam = lam
@@ -1048,7 +1050,7 @@ class PWM:
             action_mask = self._action_mask(actions_for_jae, task)
             squared_error = (reconstructed_act - actions_for_jae) ** 2 * action_mask
             # avoid division by zero if mask is all zero; clamp denominator
-            denom = action_mask.sum().clamp_min(1.0)
+            denom = action_mask.sum().clamp_min(self.jae_loss_denom_min)
             jae_loss = squared_error.sum() / denom
             jae_loss.backward()
             self.jsae_optimizer.step()
