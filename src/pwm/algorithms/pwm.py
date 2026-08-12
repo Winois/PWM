@@ -42,7 +42,7 @@ class PWM:
         obs_dim: int,
         act_dim: int,
         jsae_config: Optional[DictConfig] = None,
-        jae_loss_denom_min: float = 1.0,
+        jae_loss_denom_min: float = 1e-6,
         actor_grad_norm: Optional[float] = None,  # clip grad norms during training
         critic_grad_norm: Optional[float] = None,  # clip grad norms during training
         num_critics: int = 3,  # for critic ensembling
