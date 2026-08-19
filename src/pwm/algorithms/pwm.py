@@ -42,7 +42,7 @@ class PWM:
         obs_dim: int,
         act_dim: int,
         jsae_config: Optional[DictConfig] = None,
-        jae_loss_denom_min: float = 1e-6,
+        jsae_loss_denom_min: float = 1e-6,
         actor_grad_norm: Optional[float] = None,  # clip grad norms during training
         critic_grad_norm: Optional[float] = None,  # clip grad norms during training
         num_critics: int = 3,  # for critic ensembling
@@ -102,7 +102,7 @@ class PWM:
         self.critic_lr = critic_lr
         self.model_lr = model_lr
         self.jsae_lr = jsae_lr
-        self.jae_loss_denom_min = jae_loss_denom_min
+        self.jsae_loss_denom_min = jsae_loss_denom_min
         self.lr_schedule = lr_schedule
         self.gamma = gamma
         self.lam = lam
@@ -220,6 +220,12 @@ class PWM:
         print(self.actor)
         print(self.critic)
         print(self.wm)
+        # print("=== ACTION DEBUG ===")
+        # print("jsae =", self.jsae is not None)
+        # print("actor.action_dim =", getattr(self.actor, "action_dim", None))
+        # print("env/action dim =", self.num_actions)
+        # if self.jsae is not None:
+        #     print("jsae latent_action_dim =", self.jsae.latent_action_dim)
 
     def init_buffers(self):
         # replay buffer
@@ -296,20 +302,41 @@ class PWM:
 
     def _policy_action(self, z, task, deterministic=False):
         actor_input = z.detach() if self.detach else z
+
         policy_output = torch.tanh(
-            self.actor(actor_input, deterministic=deterministic)
+            self.actor(
+                actor_input,
+                deterministic=deterministic,
+            )
         )
-        # policy_output is latent action when JSAE is present; ensure dims
-        if self.jsae is not None:
-            if policy_output.shape[-1] != self.latent_action_dim:
-                raise ValueError(
-                    f"actor produced latent-action dim {policy_output.shape[-1]} != expected {self.latent_action_dim}"
-                )
+
+        # 普通 PWM：直接返回原始 action
         if self.jsae is None:
             return policy_output
 
+        # JSAE 模式：actor 输出的是 latent action
+        if policy_output.shape[-1] != self.latent_action_dim:
+            raise ValueError(
+                f"actor produced latent-action dim "
+                f"{policy_output.shape[-1]} != "
+                f"expected {self.latent_action_dim}"
+            )
+
         decoder_state = z.detach() if self.detach else z
-        actions = self.jsae.decode(decoder_state, policy_output)
+
+        actions = self.jsae.decode(
+            decoder_state,
+            policy_output,
+        )
+
+        # decoded action 必须回到环境 action dimension
+        if actions.shape[-1] != self.num_actions:
+            raise ValueError(
+                f"JSAE decoded action dim "
+                f"{actions.shape[-1]} != "
+                f"environment action dim {self.num_actions}"
+            )
+
         return actions * self._action_mask(actions, task)
 
     def compute_actor_loss(self, obs=None, task=None):
@@ -373,7 +400,18 @@ class PWM:
                 self.obs_buf[i] = z.clone()
 
             # act in environment
-            actions = self._policy_action(z, task)
+            if self.jsae is None:
+                # 原版 PWM 路径，保持完全不变
+                if self.detach:
+                    actions = self.actor(z.detach())
+                else:
+                    actions = self.actor(z)
+
+                actions = torch.tanh(actions)
+
+            else:
+                # 只有 JSAE 模式才进入这里
+                actions = self._policy_action(z, task)
 
             # NOTE term is not consistent here
             z, rew = self.wm.step(z, actions, task)
@@ -602,12 +640,24 @@ class PWM:
 
         games_cnt = 0
         while games_cnt < num_games:
+            if self.jsae is None:
+                # ===== 原版 PWM 路径 =====
+                actor_input = z.detach() if self.detach else z
+                actions = torch.tanh(
+                    self.actor(
+                        actor_input,
+                        deterministic=deterministic,
+                    )
+                )
 
-            actions = self._policy_action(
-                z,
-                task=None,
-                deterministic=deterministic,
-            )
+            else:
+                # ===== JSAE 路径 =====
+                actions = self._policy_action(
+                    z,
+                    task=None,
+                    deterministic=deterministic,
+                )
+
             z, rew = self.wm.step(z, actions, task=None)
 
             _, _, done, _ = self.env.step(actions)
@@ -1038,6 +1088,8 @@ class PWM:
             self.wm_optimizer.step()
 
         jae_loss = None
+        recon_mse = None
+        recon_mae = None
         if self.jsae is not None:
             # Learn the latent action representation without updating the world model.
             # Align time dimensions: states correspond to obs[:-1] and actions to act[:-1].
@@ -1046,11 +1098,31 @@ class PWM:
                 states = self.wm.encode(obs[:-1], task)
             # use actions aligned with states
             actions_for_jae = act[:-1]
-            reconstructed_act, _ = self.jsae(states, actions_for_jae)
+            #print("DEBUG JSAE states.shape =", states.shape)
+            #print("DEBUG JSAE actions_for_jae.shape =", actions_for_jae.shape)
+            states_for_jae = states[:-1]
+            #print("DEBUG JSAE states_for_jae.shape =", states_for_jae.shape)
+            reconstructed_act, _ = self.jsae(
+                states_for_jae,
+                actions_for_jae,
+            )
+
+            # 仅用于监控 JSAE reconstruction quality
+            with torch.no_grad():
+                recon_mse = F.mse_loss(
+                    reconstructed_act,
+                    actions_for_jae,
+                )
+
+                recon_mae = F.l1_loss(
+                    reconstructed_act,
+                    actions_for_jae,
+                )
+            reconstructed_act, _ = self.jsae(states_for_jae, actions_for_jae)
             action_mask = self._action_mask(actions_for_jae, task)
             squared_error = (reconstructed_act - actions_for_jae) ** 2 * action_mask
             # avoid division by zero if mask is all zero; clamp denominator
-            denom = action_mask.sum().clamp_min(self.jae_loss_denom_min)
+            denom = action_mask.sum().clamp_min(self.jsae_loss_denom_min)
             jae_loss = squared_error.sum() / denom
             jae_loss.backward()
             self.jsae_optimizer.step()
@@ -1127,6 +1199,9 @@ class PWM:
         }
         if jae_loss is not None:
             metrics["jae_loss"] = jae_loss.item()
+        if recon_mse is not None:
+            metrics["jsae_recon_mse"] = recon_mse.item()
+            metrics["jsae_recon_mae"] = recon_mae.item()
         if finetune_wm:
             metrics["wm_loss"] = wm_loss
             metrics["dynamics_loss"] = dyn_loss
@@ -1135,6 +1210,7 @@ class PWM:
         metrics = filter_dict(metrics)
         return metrics
 
+    '''
     def save(self, filename, log_dir=None, buffer=False):
         log_dir = self.log_dir if log_dir is None else log_dir
         checkpoint = {
@@ -1157,6 +1233,35 @@ class PWM:
         )
         if buffer:
             self.buffer.save(os.path.join(self.log_dir, "{}.buffer".format(filename)))
+    '''
+    def save(self, filename, log_dir=None, buffer=False):
+        log_dir = self.log_dir if log_dir is None else log_dir
+
+        checkpoint = {
+            "actor": self.actor.state_dict(),
+            "critic": self.critic.state_dict(),
+            "world_model": self.wm.state_dict(),
+            "obs_rms": self.obs_rms,
+            "rew_rms": self.rew_rms,
+            "ret_rms": self.ret_rms,
+            "actor_opt": self.actor_optimizer.state_dict(),
+            "critic_opt": self.critic_optimizer.state_dict(),
+            "world_model_opt": self.wm_optimizer.state_dict(),
+        }
+
+        if self.jsae is not None:
+            checkpoint["jsae"] = self.jsae.state_dict()
+            checkpoint["jsae_opt"] = self.jsae_optimizer.state_dict()
+
+        torch.save(
+            checkpoint,
+            os.path.join(log_dir, "{}.pt".format(filename)),
+        )
+
+        if buffer:
+            self.buffer.save(
+                os.path.join(log_dir, "{}.buffer".format(filename))
+            )
 
     def load(self, path, buffer=False):
         print("Loading policy from", path)
@@ -1325,10 +1430,33 @@ class PWM:
             reward_loss.item() / self.horizon,
         )
 
+    # def act(self, obs, t0=False, deterministic=False, task=None):
+    #     obs = torch.tensor(obs, dtype=torch.float32, device=self.device)[None]
+    #     z = self.wm.encode(obs, task)
+    #     action = self._policy_action(z, task, deterministic)
+    #     return action.cpu().detach().flatten()
     def act(self, obs, t0=False, deterministic=False, task=None):
-        obs = torch.tensor(obs, dtype=torch.float32, device=self.device)[None]
+        obs = torch.tensor(
+            obs,
+            dtype=torch.float32,
+            device=self.device,
+        )[None]
+
         z = self.wm.encode(obs, task)
-        action = self._policy_action(z, task, deterministic)
+
+        if self.jsae is None:
+            # 原版 PWM
+            action = self.actor(z, deterministic)
+            action = torch.tanh(action)
+
+        else:
+            # JSAE PWM
+            action = self._policy_action(
+                z,
+                task,
+                deterministic,
+            )
+
         return action.cpu().detach().flatten()
 
     def update_lrs(self, epoch):

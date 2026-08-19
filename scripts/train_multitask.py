@@ -305,6 +305,14 @@ def train(cfg: dict):
         metrics = {
             "iteration": i,
             "total_time": time() - start_time,
+            "task": task,
+            "seed": cfg.general.seed,
+            "algorithm": "JSAE" if agent.jsae is not None else "PWM",
+            "latent_action_dim": (
+                agent.latent_action_dim
+                if agent.jsae is not None
+                else np.nan
+            ),
         }
         metrics.update(train_metrics)
 
@@ -313,8 +321,12 @@ def train(cfg: dict):
             metrics.update(eval(agent, env, task_set, task_id, cfg.general.eval_runs))
             reward = metrics[f"episode_reward"]
             print(f"R: {reward:.2f}")
-            if i > 0:
-                agent.save(f"model_{i}", logdir) # 在每次评估后保存模型权重，文件名中包含当前的训练轮数 i，方便后续分析和模型选择。
+            # Ablation实验不保存每个中间checkpoint，避免磁盘爆满
+            #if i > 0:
+            #    agent.save(f"model_{i}", logdir) # 在每次评估后保存模型权重，文件名中包含当前的训练轮数 i，方便后续分析和模型选择。
+            # 还是保存一点吧
+            if i > 0 and i % 2000 == 0:
+                agent.save(f"model_{i}", logdir)
 
         if i % 100 == 0:
             # 确保 WML 和 JAE 不为 nan

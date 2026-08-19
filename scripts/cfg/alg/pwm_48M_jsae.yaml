@@ -9,7 +9,7 @@ actor_config:
   min_logstd: -1.427
 jsae_config:
   _target_: pwm.models.actor.JointStateActionAutoEncoder
-  latent_action_dim: 64
+  latent_action_dim: 4 #16 #64
   units: [512, 256]
   activation_class: nn.Mish
 critic_config:
