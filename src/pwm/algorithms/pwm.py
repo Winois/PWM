@@ -43,6 +43,8 @@ class PWM:
         act_dim: int,
         jsae_config: Optional[DictConfig] = None,
         jsae_loss_denom_min: float = 1e-6,
+        jsae_frozen: bool = False,
+        jsae_pretrained_checkpoint: Optional[str] = None,
         actor_grad_norm: Optional[float] = None,  # clip grad norms during training
         critic_grad_norm: Optional[float] = None,  # clip grad norms during training
         num_critics: int = 3,  # for critic ensembling
@@ -103,6 +105,10 @@ class PWM:
         self.model_lr = model_lr
         self.jsae_lr = jsae_lr
         self.jsae_loss_denom_min = jsae_loss_denom_min
+        # Frozen-JSAE ablation settings
+        self.jsae_frozen = bool(jsae_frozen)
+        self.jsae_pretrained_checkpoint = jsae_pretrained_checkpoint
+        self._jsae_frozen_reference = None
         self.lr_schedule = lr_schedule
         self.gamma = gamma
         self.lam = lam
@@ -146,15 +152,78 @@ class PWM:
         os.makedirs(self.log_dir, exist_ok=True)
 
         # Create actor and critic
+        # ============================================================
+        # Create JSAE
+        # ============================================================
         self.jsae = None
         self.latent_action_dim = self.num_actions
+
         if jsae_config is not None:
             self.jsae = instantiate(
                 jsae_config,
                 state_dim=latent_dim,
                 action_dim=self.num_actions,
             ).to(self.device)
+
             self.latent_action_dim = self.jsae.latent_action_dim
+
+
+        # ============================================================
+        # Frozen-JSAE ablation
+        #
+        # Order is intentionally:
+        #   1. create JSAE
+        #   2. load pretrained JSAE weights
+        #   3. freeze parameters
+        #   4. save a reference copy for verification
+        # ============================================================
+        if self.jsae_frozen:
+
+            if self.jsae is None:
+                raise ValueError(
+                    "jsae_frozen=True requires jsae_config to be enabled."
+                )
+
+            if self.jsae_pretrained_checkpoint is None:
+                raise ValueError(
+                    "jsae_frozen=True requires "
+                    "jsae_pretrained_checkpoint."
+                )
+
+            print("=" * 70)
+            print("JSAE FROZEN MODE")
+            print(
+                "Loading pretrained JSAE from:",
+                self.jsae_pretrained_checkpoint,
+            )
+            print("=" * 70)
+
+            # ① Load pretrained JSAE
+            self._load_jsae_only(
+                self.jsae_pretrained_checkpoint
+            )
+
+            # ② Freeze JSAE parameters
+            for param in self.jsae.parameters():
+                param.requires_grad_(False)
+
+            # Keep the frozen module itself in evaluation mode
+            self.jsae.eval()
+
+            # ③ Save reference parameters AFTER loading + freezing.
+            # Later we use this to verify that the JSAE has not changed.
+            self._jsae_frozen_reference = {
+                name: param.detach().clone()
+                for name, param in self.jsae.named_parameters()
+            }
+
+            print(
+                "JSAE frozen:",
+                all(
+                    not param.requires_grad
+                    for param in self.jsae.parameters()
+                ),
+            )
 
         self.actor = instantiate(
             actor_config,
@@ -206,12 +275,14 @@ class PWM:
             lr=self.model_lr,
         )
         self.jsae_optimizer = None
-        if self.jsae is not None:
+        if self.jsae is not None and not self.jsae_frozen:
             self.jsae_optimizer = torch.optim.Adam(
                 self.jsae.parameters(),
                 lr=self.jsae_lr,
                 betas=betas,
             )
+        else:
+            self.jsae_optimizer = None
 
         # counting variables
         self.iter_count = 0
@@ -226,6 +297,54 @@ class PWM:
         # print("env/action dim =", self.num_actions)
         # if self.jsae is not None:
         #     print("jsae latent_action_dim =", self.jsae.latent_action_dim)
+
+    def _load_jsae_only(self, path):
+        """
+        Load only the JSAE parameters from a previously saved
+        PWM+JSAE checkpoint.
+
+        Actor, critic, world model, and optimizer states are NOT loaded.
+        This is used for the Frozen-JSAE ablation.
+        """
+
+        if self.jsae is None:
+            raise RuntimeError(
+                "_load_jsae_only() called but self.jsae is None."
+            )
+
+        print(f"Loading JSAE parameters from {path}")
+
+        checkpoint = torch.load(
+            path,
+            map_location=self.device,
+            weights_only=False,
+        )
+
+        if not isinstance(checkpoint, dict):
+            raise TypeError(
+                f"Expected checkpoint to be a dict, "
+                f"but got {type(checkpoint)}"
+            )
+
+        if "jsae" not in checkpoint:
+            raise KeyError(
+                f"Checkpoint {path} does not contain key 'jsae'. "
+                f"Available keys: {list(checkpoint.keys())}"
+            )
+
+        if checkpoint["jsae"] is None:
+            raise ValueError(
+                f"Checkpoint {path} contains jsae=None."
+            )
+
+        self.jsae.load_state_dict(
+            checkpoint["jsae"],
+            strict=True,
+        )
+
+        self.jsae.to(self.device)
+
+        print("Successfully loaded pretrained JSAE.")
 
     def init_buffers(self):
         # replay buffer
@@ -1079,135 +1198,442 @@ class PWM:
 
         L, bsz, obs_dim = obs.shape
 
-        # train world model
+        # ========================================================
+        # 1. Train / finetune world model
+        # ========================================================
         if finetune_wm:
             self.wm_optimizer.zero_grad()
-            wm_loss, dyn_loss, rew_loss = self.compute_wm_loss(obs, act, rew, task)
+
+            wm_loss, dyn_loss, rew_loss = self.compute_wm_loss(
+                obs,
+                act,
+                rew,
+                task,
+            )
+
             wm_loss.backward()
-            wm_grad_norm = clip_grad_norm_(self.wm.parameters(), self.wm_grad_norm)
+
+            wm_grad_norm = clip_grad_norm_(
+                self.wm.parameters(),
+                self.wm_grad_norm,
+            )
+
             self.wm_optimizer.step()
 
+        # ========================================================
+        # 2. JSAE reconstruction
+        # ========================================================
         jae_loss = None
         recon_mse = None
         recon_mae = None
+
         if self.jsae is not None:
-            # Learn the latent action representation without updating the world model.
-            # Align time dimensions: states correspond to obs[:-1] and actions to act[:-1].
-            self.jsae_optimizer.zero_grad()
+
+            # ----------------------------------------------------
+            # Encode states using the fixed / pretrained WM.
+            #
+            # Keep the time alignment exactly as in the currently
+            # working version:
+            #
+            # states           : [16, B, latent_dim]
+            # actions_for_jae  : [15, B, action_dim]
+            # states_for_jae   : [15, B, latent_dim]
+            # ----------------------------------------------------
             with torch.no_grad():
-                states = self.wm.encode(obs[:-1], task)
-            # use actions aligned with states
+                states = self.wm.encode(
+                    obs[:-1],
+                    task,
+                )
+
             actions_for_jae = act[:-1]
-            #print("DEBUG JSAE states.shape =", states.shape)
-            #print("DEBUG JSAE actions_for_jae.shape =", actions_for_jae.shape)
             states_for_jae = states[:-1]
-            #print("DEBUG JSAE states_for_jae.shape =", states_for_jae.shape)
-            reconstructed_act, _ = self.jsae(
-                states_for_jae,
-                actions_for_jae,
-            )
 
-            # 仅用于监控 JSAE reconstruction quality
-            with torch.no_grad():
-                recon_mse = F.mse_loss(
-                    reconstructed_act,
+            # ====================================================
+            # 2A. FROZEN JSAE
+            # ====================================================
+            if self.jsae_frozen:
+
+                # No gradients are required here because this block
+                # only evaluates reconstruction quality.
+                #
+                # IMPORTANT:
+                # this no_grad() is ONLY for reconstruction
+                # monitoring. We do NOT put no_grad() around the
+                # decoder when computing the actor loss.
+                with torch.no_grad():
+
+                    # First forward: reconstruction metrics
+                    reconstructed_act, _ = self.jsae(
+                        states_for_jae,
+                        actions_for_jae,
+                    )
+
+                    recon_mse = F.mse_loss(
+                        reconstructed_act,
+                        actions_for_jae,
+                    )
+
+                    recon_mae = F.l1_loss(
+                        reconstructed_act,
+                        actions_for_jae,
+                    )
+
+                    # Keep the original JSAE loss definition
+                    reconstructed_act_for_loss, _ = self.jsae(
+                        states_for_jae,
+                        actions_for_jae,
+                    )
+
+                    action_mask = self._action_mask(
+                        actions_for_jae,
+                        task,
+                    )
+
+                    squared_error = (
+                        reconstructed_act_for_loss
+                        - actions_for_jae
+                    ) ** 2
+
+                    squared_error = (
+                        squared_error * action_mask
+                    )
+
+                    denom = (
+                        action_mask
+                        .sum()
+                        .clamp_min(
+                            self.jsae_loss_denom_min
+                        )
+                    )
+
+                    jae_loss = (
+                        squared_error.sum()
+                        / denom
+                    )
+
+                # NO:
+                # self.jsae_optimizer.zero_grad()
+                # jae_loss.backward()
+                # self.jsae_optimizer.step()
+
+            # ====================================================
+            # 2B. ONLINE / NORMAL JSAE
+            # ====================================================
+            else:
+
+                if self.jsae_optimizer is None:
+                    raise RuntimeError(
+                        "JSAE is trainable but "
+                        "self.jsae_optimizer is None."
+                    )
+
+                self.jsae_optimizer.zero_grad()
+
+                # First forward: reconstruction metrics
+                reconstructed_act, _ = self.jsae(
+                    states_for_jae,
                     actions_for_jae,
                 )
 
-                recon_mae = F.l1_loss(
-                    reconstructed_act,
+                with torch.no_grad():
+
+                    recon_mse = F.mse_loss(
+                        reconstructed_act,
+                        actions_for_jae,
+                    )
+
+                    recon_mae = F.l1_loss(
+                        reconstructed_act,
+                        actions_for_jae,
+                    )
+
+                # Second forward:
+                # preserve the behaviour of your current code.
+                reconstructed_act_for_loss, _ = self.jsae(
+                    states_for_jae,
                     actions_for_jae,
                 )
-            reconstructed_act, _ = self.jsae(states_for_jae, actions_for_jae)
-            action_mask = self._action_mask(actions_for_jae, task)
-            squared_error = (reconstructed_act - actions_for_jae) ** 2 * action_mask
-            # avoid division by zero if mask is all zero; clamp denominator
-            denom = action_mask.sum().clamp_min(self.jsae_loss_denom_min)
-            jae_loss = squared_error.sum() / denom
-            jae_loss.backward()
-            self.jsae_optimizer.step()
 
-        # train actor
+                action_mask = self._action_mask(
+                    actions_for_jae,
+                    task,
+                )
+
+                squared_error = (
+                    reconstructed_act_for_loss
+                    - actions_for_jae
+                ) ** 2
+
+                squared_error = (
+                    squared_error * action_mask
+                )
+
+                denom = (
+                    action_mask
+                    .sum()
+                    .clamp_min(
+                        self.jsae_loss_denom_min
+                    )
+                )
+
+                jae_loss = (
+                    squared_error.sum()
+                    / denom
+                )
+
+                jae_loss.backward()
+
+                self.jsae_optimizer.step()
+
+        # ========================================================
+        # 3. Train actor
+        # ========================================================
         self.actor_optimizer.zero_grad()
+
+        # World-model parameters themselves should not receive
+        # actor gradients.
         self.wm.requires_grad_(False)
+
+        # JSAE parameters should not receive actor gradients.
+        #
+        # NOTE:
+        # requires_grad_(False) does NOT stop gradients flowing
+        # through the decoder with respect to its input latent
+        # action. Therefore actor gradients can still propagate:
+        #
+        # actor -> latent action -> decoder -> physical action
+        #       -> world model -> actor loss
         if self.jsae is not None:
             self.jsae.requires_grad_(False)
 
-        # NOTE not sure about dimensionality below
-        actor_loss = self.compute_actor_loss(obs[0], task)
+        actor_loss = self.compute_actor_loss(
+            obs[0],
+            task,
+        )
+
         actor_loss.backward()
 
-        self.actor_grad_norm_before_clip = tu.grad_norm(self.actor.parameters())
+        self.actor_grad_norm_before_clip = tu.grad_norm(
+            self.actor.parameters()
+        )
+
         self.actor_grad_norm_after_clip = clip_grad_norm_(
-            self.actor.parameters(), self.actor_grad_norm
+            self.actor.parameters(),
+            self.actor_grad_norm,
         )
 
         # sanity check
-        if torch.isnan(self.actor_grad_norm_before_clip):
+        if torch.isnan(
+            self.actor_grad_norm_before_clip
+        ):
             print_error("NaN gradient")
             raise ValueError
 
         self.actor_optimizer.step()
+
+        # --------------------------------------------------------
+        # Restore WM gradient state
+        # --------------------------------------------------------
         self.wm.requires_grad_(True)
-        if self.jsae is not None:
+
+        # --------------------------------------------------------
+        # Restore JSAE gradient state ONLY for normal online JSAE.
+        #
+        # Frozen JSAE must remain frozen permanently.
+        # --------------------------------------------------------
+        if (
+            self.jsae is not None
+            and not self.jsae_frozen
+        ):
             self.jsae.requires_grad_(True)
 
-        # prepare dataset
-        critic_batch_size = bsz * self.horizon // self.critic_batches
+        # ========================================================
+        # 4. Prepare critic dataset
+        # ========================================================
+        critic_batch_size = (
+            bsz
+            * self.horizon
+            // self.critic_batches
+        )
+
         with torch.no_grad():
+
             self.compute_target_values()
+
             dataset = CriticDataset(
                 critic_batch_size,
                 self.obs_buf,
                 self.target_values,
             )
 
-        # critic training!
+        # ========================================================
+        # 5. Train critic
+        # ========================================================
         value_loss = 0.0
-        for j in range(self.critic_iterations):
+
+        for j in range(
+            self.critic_iterations
+        ):
+
             total_critic_loss = 0.0
             batch_cnt = 0
-            for i in range(len(dataset)):
+
+            for i in range(
+                len(dataset)
+            ):
+
                 batch_sample = dataset[i]
+
                 self.critic_optimizer.zero_grad()
-                training_critic_loss = self.compute_critic_loss(batch_sample)
+
+                training_critic_loss = (
+                    self.compute_critic_loss(
+                        batch_sample
+                    )
+                )
+
                 training_critic_loss.backward()
 
-                # ugly fix for simulation nan problem
+                # Existing NaN-gradient protection
                 for params in self.critic.parameters():
-                    params.grad.nan_to_num_(0.0, 0.0, 0.0)
+
+                    if params.grad is not None:
+                        params.grad.nan_to_num_(
+                            0.0,
+                            0.0,
+                            0.0,
+                        )
 
                 critic_grad_norm = clip_grad_norm_(
-                    self.critic.parameters(), self.critic_grad_norm
+                    self.critic.parameters(),
+                    self.critic_grad_norm,
                 )
+
                 self.critic_optimizer.step()
 
-                total_critic_loss += training_critic_loss
+                total_critic_loss += (
+                    training_critic_loss
+                )
+
                 batch_cnt += 1
 
-            value_loss += total_critic_loss / batch_cnt
+            value_loss += (
+                total_critic_loss
+                / batch_cnt
+            )
 
-        value_loss /= self.critic_iterations
+        value_loss /= (
+            self.critic_iterations
+        )
 
-        ac_stddev = self.actor.get_logstd().exp().mean().detach().cpu().item()
+        # Existing actor std calculation
+        ac_stddev = (
+            self.actor
+            .get_logstd()
+            .exp()
+            .mean()
+            .detach()
+            .cpu()
+            .item()
+        )
 
+        # ========================================================
+        # 6. Verify Frozen JSAE really has not changed
+        # ========================================================
+        jsae_max_param_change = None
+
+        if (
+            self.jsae is not None
+            and self.jsae_frozen
+        ):
+
+            if (
+                self._jsae_frozen_reference
+                is None
+            ):
+                raise RuntimeError(
+                    "Frozen JSAE reference "
+                    "parameters were not initialized."
+                )
+
+            with torch.no_grad():
+
+                max_change = 0.0
+
+                for (
+                    name,
+                    param,
+                ) in self.jsae.named_parameters():
+
+                    reference = (
+                        self._jsae_frozen_reference[
+                            name
+                        ]
+                    )
+
+                    change = (
+                        param.detach()
+                        - reference
+                    ).abs().max().item()
+
+                    max_change = max(
+                        max_change,
+                        change,
+                    )
+
+                jsae_max_param_change = (
+                    max_change
+                )
+
+        # ========================================================
+        # 7. Metrics
+        # ========================================================
         metrics = {
-            "actor_loss": actor_loss.item(),
-            "value_loss": value_loss.item(),
-            "actor_grad_norm": self.actor_grad_norm_before_clip.item(),
-            "critic_grad_norm": critic_grad_norm.item(),
+            "actor_loss":
+                actor_loss.item(),
+
+            "value_loss":
+                value_loss.item(),
+
+            "actor_grad_norm":
+                self.actor_grad_norm_before_clip.item(),
+
+            "critic_grad_norm":
+                critic_grad_norm.item(),
         }
+
         if jae_loss is not None:
-            metrics["jae_loss"] = jae_loss.item()
+            metrics["jae_loss"] = (
+                jae_loss.item()
+            )
+
         if recon_mse is not None:
-            metrics["jsae_recon_mse"] = recon_mse.item()
-            metrics["jsae_recon_mae"] = recon_mae.item()
+            metrics["jsae_recon_mse"] = (
+                recon_mse.item()
+            )
+
+            metrics["jsae_recon_mae"] = (
+                recon_mae.item()
+            )
+
+        if self.jsae is not None:
+            metrics["jsae_frozen"] = int(
+                self.jsae_frozen
+            )
+
+        if jsae_max_param_change is not None:
+            metrics[
+                "jsae_max_param_change"
+            ] = jsae_max_param_change
+
         if finetune_wm:
             metrics["wm_loss"] = wm_loss
             metrics["dynamics_loss"] = dyn_loss
             metrics["reward_loss"] = rew_loss
             metrics["wm_grad_norm"] = wm_grad_norm
+
         metrics = filter_dict(metrics)
+
         return metrics
 
     '''
@@ -1251,7 +1677,8 @@ class PWM:
 
         if self.jsae is not None:
             checkpoint["jsae"] = self.jsae.state_dict()
-            checkpoint["jsae_opt"] = self.jsae_optimizer.state_dict()
+            if self.jsae_optimizer is not None:
+                checkpoint["jsae_opt"] = self.jsae_optimizer.state_dict()
 
         torch.save(
             checkpoint,
@@ -1277,6 +1704,17 @@ class PWM:
                 raise ValueError("checkpoint does not contain JSAE parameters")
             self.jsae.load_state_dict(checkpoint["jsae"])
             self.jsae.to(self.device)
+            # 这样以后 resume Frozen checkpoint 也不会解冻
+            if self.jsae_frozen: 
+                for param in self.jsae.parameters():
+                    param.requires_grad_(False)
+                self.jsae.eval()
+                self._jsae_frozen_reference = {
+                    name: param.detach().clone()
+                    for name, param
+                    in self.jsae.named_parameters()
+                }
+
         self.obs_rms = (
             checkpoint["obs_rms"].to(self.device)
             if checkpoint["obs_rms"] is not None
@@ -1300,7 +1738,7 @@ class PWM:
         self.critic_lr = checkpoint["critic_opt"]["param_groups"][0]["lr"]
         self.wm_optimizer.load_state_dict(checkpoint["world_model_opt"])
         self.model_lr = checkpoint["world_model_opt"]["param_groups"][0]["lr"]
-        if self.jsae_optimizer is not None:
+        if self.jsae_optimizer is not None and "jsae_opt" in checkpoint:
             if "jsae_opt" not in checkpoint or checkpoint["jsae_opt"] is None:
                 raise ValueError("checkpoint does not contain a JSAE optimizer")
             self.jsae_optimizer.load_state_dict(checkpoint["jsae_opt"])
@@ -1327,6 +1765,68 @@ class PWM:
                 new_odict[key] = value
 
         self.wm.load_state_dict(new_odict)
+
+    def _load_jsae_only(self, path): 
+        """
+        Load ONLY JSAE parameters from a PWM/JSAE checkpoint.
+
+        Actor, critic, world model and optimizers are intentionally
+        NOT restored. This is used for the frozen-JSAE ablation.
+        所以新实验里RL policy是新训练的，JSAE是预训练的。
+        JSAE的参数在预训练阶段已经学到了一个好的latent action representation。
+        """
+        checkpoint = torch.load(
+            path,
+            map_location=self.device,
+            weights_only=False,
+        )
+
+        # Case 1:
+        # checkpoint["jsae"]
+        if (
+            isinstance(checkpoint, dict)
+            and "jsae" in checkpoint
+        ):
+            jsae_state = checkpoint["jsae"]
+
+        # Case 2:
+        # checkpoint["model"]["jsae"]
+        elif (
+            isinstance(checkpoint, dict)
+            and "model" in checkpoint
+            and isinstance(checkpoint["model"], dict)
+            and "jsae" in checkpoint["model"]
+        ):
+            jsae_state = checkpoint["model"]["jsae"]
+
+        else:
+            print(
+                "Checkpoint top-level keys:",
+                checkpoint.keys()
+                if isinstance(checkpoint, dict)
+                else type(checkpoint)
+            )
+
+            if (
+                isinstance(checkpoint, dict)
+                and "model" in checkpoint
+                and isinstance(checkpoint["model"], dict)
+            ):
+                print(
+                    "Checkpoint['model'] keys:",
+                    checkpoint["model"].keys()
+                )
+
+            raise KeyError(
+                f"Cannot find JSAE state_dict in checkpoint: {path}"
+            )
+
+        self.jsae.load_state_dict(
+            jsae_state,
+            strict=True,
+        )
+
+        print("Successfully loaded pretrained JSAE.")
 
     def pretrain_wm(self, paths, num_iters, actually_train=True):
         if type(paths) != List:

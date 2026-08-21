@@ -12,8 +12,11 @@ jsae_config:
   latent_action_dim: 4 #16 #64
   units: [512, 256]
   activation_class: nn.Mish
-  frozen: false
-  pretrained_checkpoint: null
+
+# Frozen-JSAE control
+jsae_frozen: true
+jsae_pretrained_checkpoint: null
+
 critic_config:
   _target_: pwm.models.critic.CriticMLP
   units: [400, 200]
