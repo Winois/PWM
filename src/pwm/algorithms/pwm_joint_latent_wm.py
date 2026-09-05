@@ -72,6 +72,7 @@ class PWM:
         log: bool = False,
         detach: bool = False,
     ):
+        print("Using Joint Latent WM")
         # sanity check parameters
         assert horizon > 0
         assert max_epochs >= 0
@@ -156,8 +157,13 @@ class PWM:
         # Create JSAE
         # ============================================================
         self.jsae = None
-        self.latent_action_dim = self.num_actions # wm(s, a) 8.22
-        #wm_action_dim = self.latent_action_dim if self.jsae is not None else self.num_actions #wm(s,z)
+        self.latent_action_mean = 0.0 # 用来观察 actor 输出的 latent action 是否有 drift
+        self.latent_action_std = 0.0
+        self.decoded_action_mean = 0.0
+        self.decoded_action_std = 0.0
+        self.latent_action_dim = self.num_actions
+        self.prev_decoded_action = None # 用来计算 decoded action drift
+        self.decoded_action_drift = 0.0
 
         if jsae_config is not None:
             self.jsae = instantiate(
@@ -168,13 +174,13 @@ class PWM:
 
             self.latent_action_dim = self.jsae.latent_action_dim
 
-        # 新增
+            # store previous JSAE parameters for drift measurement
         if self.jsae is not None:
+
             self._prev_jsae_params = {
                 name: param.detach().clone()
                 for name, param in self.jsae.named_parameters()
             }
-
 
         # ============================================================
         # Frozen-JSAE ablation
@@ -254,10 +260,14 @@ class PWM:
         ]
         self.critic = Ensemble(critics)
 
+        # Joint latent-action WM:
+        # World model dynamics/reward now operate on latent actions.
+        wm_action_dim = self.latent_action_dim if self.jsae is not None else self.num_actions
+
         self.wm = instantiate(
             world_model_config,
             observation_dim=self.num_obs,
-            action_dim=self.num_actions,
+            action_dim=wm_action_dim,
             latent_dim=self.latent_dim,
         ).to(self.device)
 
@@ -273,14 +283,37 @@ class PWM:
             betas,
         )
 
+        # ============================================================
+        # Conservative Joint Latent WM fine-tuning
+        #
+        # Freeze:
+        #   WM encoder (keep pretrained state representation)
+        #
+        # Update:
+        #   WM dynamics
+        #   WM reward
+        #
+        # JSAE has independent optimizer
+        # ============================================================
+
+        # Freeze WM encoder
+        for param in self.wm._encoder.parameters():
+            param.requires_grad_(False)
+
+
+        # Small LR for WM adaptation
         self.wm_optimizer = torch.optim.Adam(
             [
-                {"params": self.wm._encoder.parameters()},
-                {"params": self.wm._dynamics.parameters()},
-                {"params": self.wm._reward.parameters()},
-                {"params": (self.wm._task_emb.parameters() if False else [])},
+                {
+                    "params": self.wm._dynamics.parameters(),
+                    "lr": self.model_lr * 0.05,
+                },
+                {
+                    "params": self.wm._reward.parameters(),
+                    "lr": self.model_lr * 0.05,
+                },
             ],
-            lr=self.model_lr,
+            betas=betas,
         )
         self.jsae_optimizer = None
         if self.jsae is not None and not self.jsae_frozen:
@@ -437,6 +470,24 @@ class PWM:
             )
         )
 
+        # ==================================================
+        # Latent action statistics
+        # ==================================================
+        with torch.no_grad():
+            self.latent_action_mean = (
+                policy_output.mean()
+                .detach()
+                .cpu()
+                .item()
+            )
+
+            self.latent_action_std = (
+                policy_output.std()
+                .detach()
+                .cpu()
+                .item()
+            )
+
         # 普通 PWM：直接返回原始 action
         if self.jsae is None:
             return policy_output
@@ -455,6 +506,46 @@ class PWM:
             decoder_state,
             policy_output,
         )
+
+        # ==================================================
+        # Decoded action statistics and drift
+        # 第一次 prev_decoded_action 为 None，drift 设为 0.0
+        # 然后每次迭代都更新 prev_decoded_action 为当前的 decoded action
+        # drift = sqrt(mean((current_decoded_action - prev_decoded_action)^2))
+        # ==================================================
+        with torch.no_grad():
+            self.decoded_action_mean = (
+                actions.mean()
+                .detach()
+                .cpu()
+                .item()
+            )
+
+            self.decoded_action_std = (
+                actions.std()
+                .detach()
+                .cpu()
+                .item()
+            )
+
+
+            if self.prev_decoded_action is not None:
+                self.decoded_action_drift = (
+                    (actions - self.prev_decoded_action)
+                    .pow(2)
+                    .mean()
+                    .sqrt()
+                    .cpu()
+                    .item()
+                )
+
+            else:
+                self.decoded_action_drift = 0.0
+
+            self.prev_decoded_action = (
+                actions.detach()
+                .clone()
+            )
 
         # decoded action 必须回到环境 action dimension
         if actions.shape[-1] != self.num_actions:
@@ -538,7 +629,9 @@ class PWM:
 
             else:
                 # 只有 JSAE 模式才进入这里
-                actions = self._policy_action(z, task)
+                actions = self._policy_action(z, task) 
+                # 这个actions不是原始action，而是经过JSAE解码的latent action
+                # 最后保存的是最后一步的 latent action statistics。更严谨一点，可以累积平均。
 
             # NOTE term is not consistent here
             z, rew = self.wm.step(z, actions, task)
@@ -1212,6 +1305,9 @@ class PWM:
         if finetune_wm:
             self.wm_optimizer.zero_grad()
 
+            if self.jsae_optimizer is not None:
+                self.jsae_optimizer.zero_grad()
+
             wm_loss, dyn_loss, rew_loss = self.compute_wm_loss(
                 obs,
                 act,
@@ -1227,6 +1323,9 @@ class PWM:
             )
 
             self.wm_optimizer.step()
+
+            if self.jsae_optimizer is not None:
+                self.jsae_optimizer.step()
 
         # ========================================================
         # 2. JSAE reconstruction
@@ -1392,6 +1491,7 @@ class PWM:
                 jae_loss.backward()
 
                 self.jsae_optimizer.step()
+
                 # ==================================================
                 # JSAE parameter drift (Joint training only) 计算drift
                 # ==================================================
@@ -1471,7 +1571,16 @@ class PWM:
         # --------------------------------------------------------
         # Restore WM gradient state
         # --------------------------------------------------------
-        self.wm.requires_grad_(True)
+        # Restore trainable parts of Joint WM
+        for param in self.wm._dynamics.parameters():
+            param.requires_grad_(True)
+
+        for param in self.wm._reward.parameters():
+            param.requires_grad_(True)
+
+        # Pretrained observation encoder must remain frozen
+        for param in self.wm._encoder.parameters():
+            param.requires_grad_(False)
 
         # --------------------------------------------------------
         # Restore JSAE gradient state ONLY for normal online JSAE.
@@ -1637,6 +1746,21 @@ class PWM:
 
             "critic_grad_norm":
                 critic_grad_norm.item(),
+
+            "latent_action_mean":
+                self.latent_action_mean,
+
+            "latent_action_std":
+                self.latent_action_std,
+
+            "decoded_action_mean":
+                self.decoded_action_mean,
+
+            "decoded_action_std":
+                self.decoded_action_std,
+
+            "decoded_action_drift":
+                self.decoded_action_drift,
         }
 
         if jae_loss is not None:
@@ -1648,21 +1772,23 @@ class PWM:
             metrics["jsae_recon_mse"] = (
                 recon_mse.item()
             )
+            #metrics["action_recon_mse"] = recon_mse.item() 
+            # 保持 jsae_recon_mse，论文里解释为 Action Reconstruction MSE 即可
 
             metrics["jsae_recon_mae"] = (
                 recon_mae.item()
             )
-
-        if self.jsae is not None and not self.jsae_frozen:
-            metrics["jsae_param_drift"] = (
-                jsae_param_drift
-            )
-            # 用于验证 joint training 的 JSAE 的漂移速度
+            #metrics["action_recon_mae"] = recon_mae.item()
 
         if self.jsae is not None:
             metrics["jsae_frozen"] = int(
                 self.jsae_frozen
             )
+
+        if self.jsae is not None and not self.jsae_frozen:
+            metrics["jsae_param_drift"] = (
+                jsae_param_drift
+            ) # 用于验证 joint training 的 JSAE 的漂移速度
 
         if jsae_max_param_change is not None:
             metrics[
@@ -1671,10 +1797,13 @@ class PWM:
             # 用于验证 frozen JSAE 是否真的没有改变，即真的冻结
 
         if finetune_wm:
-            metrics["wm_loss"] = wm_loss
-            metrics["dynamics_loss"] = dyn_loss
-            metrics["reward_loss"] = rew_loss
+            # metrics["wm_loss"] = wm_loss
+            # metrics["dynamics_loss"] = dyn_loss
+            # metrics["reward_loss"] = rew_loss
             metrics["wm_grad_norm"] = wm_grad_norm
+            metrics["wm_loss"] = float(wm_loss)
+            metrics["dynamics_loss"] = float(dyn_loss)
+            metrics["reward_loss"] = float(rew_loss)
 
         metrics = filter_dict(metrics)
 
@@ -1931,6 +2060,17 @@ class PWM:
         self.wm_bootstrapped = True
         self.save("pretrained", buffer=True)
 
+    def encode_latent_action(self, state, action):
+        """Convert environment action into latent action for joint latent WM."""
+        if self.jsae is None:
+            return action
+
+        _, latent_action = self.jsae(
+            state,
+            action,
+        )
+        return latent_action
+
     def compute_wm_loss(self, obs, act, rew, task=None):
         horizon, batch_size, _ = obs.shape
         assert horizon == self.horizon + 1
@@ -1943,6 +2083,14 @@ class PWM:
         # Compute targets
         with torch.no_grad():
             next_z = self.wm.encode(obs[1:], task)
+
+        # Convert physical actions into latent actions before WM training.
+        # Joint latent-action WM learns p(z_{t+1}|z_t,z_action)
+        #with torch.no_grad():
+        latent_actions = self.encode_latent_action(
+            self.wm.encode(obs[:-1], task),
+            act,
+        )
 
         # Latent rollout
         zs = torch.empty(
@@ -1957,12 +2105,12 @@ class PWM:
 
         dynamics_loss = 0.0
         for t in range(self.horizon):
-            z = self.wm.next(z, act[t], task)
+            z = self.wm.next(z, latent_actions[t], task)
             dynamics_loss += F.mse_loss(z, next_z[t]) * self.gamma**t
             zs[t + 1] = z
 
         _zs = zs[:-1]
-        rew_hat = self.wm.reward(_zs, act, task)
+        rew_hat = self.wm.reward(_zs, latent_actions, task)
         reward_loss = (rew_hat - rew) ** 2 * discount
         reward_loss = reward_loss.mean()
 
