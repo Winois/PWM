@@ -271,6 +271,19 @@ class PWM:
             latent_dim=self.latent_dim,
         ).to(self.device)
 
+        # WM masks have latent-action width in joint mode. Keep a separate
+        # physical-action mask for decoded environment actions and JSAE loss.
+        self._physical_action_masks = None
+        if self.wm.multitask:
+            action_dims = list(world_model_config.action_dims)
+            self._physical_action_masks = torch.zeros(
+                len(action_dims), self.num_actions, device=self.device
+            )
+            for task_index, task_action_dim in enumerate(action_dims):
+                self._physical_action_masks[
+                    task_index, : int(task_action_dim)
+                ] = 1.0
+
         # initialize optimizers
         self.actor_optimizer = torch.optim.Adam(
             self.actor.parameters(),
@@ -455,12 +468,13 @@ class PWM:
         if task is None:
             raise ValueError("task is required for multitask action masking")
         task_ids = torch.as_tensor(task, device=actions.device).long()
-        mask = self.wm._action_masks[task_ids]
+        mask = self._physical_action_masks[task_ids]
         while mask.ndim < actions.ndim:
             mask = mask.unsqueeze(0)
         return mask.expand_as(actions)
 
-    def _policy_action(self, z, task, deterministic=False):
+    def _policy_actions(self, z, task, deterministic=False):
+        """Return the separate actions consumed by the WM and environment."""
         actor_input = z.detach() if self.detach else z
 
         policy_output = torch.tanh(
@@ -490,7 +504,7 @@ class PWM:
 
         # 普通 PWM：直接返回原始 action
         if self.jsae is None:
-            return policy_output
+            return policy_output, policy_output
 
         # JSAE 模式：actor 输出的是 latent action
         if policy_output.shape[-1] != self.latent_action_dim:
@@ -555,7 +569,13 @@ class PWM:
                 f"environment action dim {self.num_actions}"
             )
 
-        return actions * self._action_mask(actions, task)
+        decoded_action = actions * self._action_mask(actions, task)
+        return policy_output, decoded_action
+
+    def _policy_action(self, z, task, deterministic=False):
+        """Return the decoded physical action used by acting APIs."""
+        _, decoded_action = self._policy_actions(z, task, deterministic)
+        return decoded_action
 
     def compute_actor_loss(self, obs=None, task=None):
 
@@ -621,20 +641,19 @@ class PWM:
             if self.jsae is None:
                 # 原版 PWM 路径，保持完全不变
                 if self.detach:
-                    actions = self.actor(z.detach())
+                    env_action = self.actor(z.detach())
                 else:
-                    actions = self.actor(z)
+                    env_action = self.actor(z)
 
-                actions = torch.tanh(actions)
+                env_action = torch.tanh(env_action)
+                wm_action = env_action
 
             else:
-                # 只有 JSAE 模式才进入这里
-                actions = self._policy_action(z, task) 
-                # 这个actions不是原始action，而是经过JSAE解码的latent action
-                # 最后保存的是最后一步的 latent action statistics。更严谨一点，可以累积平均。
+                # Joint mode: latent action goes to WM, decoded action to env.
+                wm_action, env_action = self._policy_actions(z, task)
 
             # NOTE term is not consistent here
-            z, rew = self.wm.step(z, actions, task)
+            z, rew = self.wm.step(z, wm_action, task)
             rew = self.wm.almost_two_hot_inv(rew).squeeze()
 
             if torch.any(torch.isnan(rew)):
@@ -642,7 +661,7 @@ class PWM:
                 rew = torch.nan_to_num(rew, 0.0, 0.0, 0.0)
 
             if self.env:
-                obs, gt_rew, gt_done, info = self.env.step(actions)
+                obs, gt_rew, gt_done, info = self.env.step(env_action)
                 term = info["termination"]
                 gt_term = info["termination"]
                 gt_trunc = info["truncation"]
@@ -677,7 +696,7 @@ class PWM:
                         td = TensorDict(
                             dict(
                                 obs=real_obs[j].unsqueeze(0),
-                                action=actions[j].unsqueeze(0),
+                                action=env_action[j].unsqueeze(0),
                                 reward=gt_rew[j][None],
                                 term=gt_term[j][None],
                             ),
@@ -863,24 +882,25 @@ class PWM:
             if self.jsae is None:
                 # ===== 原版 PWM 路径 =====
                 actor_input = z.detach() if self.detach else z
-                actions = torch.tanh(
+                env_action = torch.tanh(
                     self.actor(
                         actor_input,
                         deterministic=deterministic,
                     )
                 )
+                wm_action = env_action
 
             else:
                 # ===== JSAE 路径 =====
-                actions = self._policy_action(
+                wm_action, env_action = self._policy_actions(
                     z,
                     task=None,
                     deterministic=deterministic,
                 )
 
-            z, rew = self.wm.step(z, actions, task=None)
+            z, rew = self.wm.step(z, wm_action, task=None)
 
-            _, _, done, _ = self.env.step(actions)
+            _, _, done, _ = self.env.step(env_action)
 
             episode_length += 1
 
