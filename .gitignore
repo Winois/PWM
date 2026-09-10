@@ -62,3 +62,18 @@ r_plots/*.png
 .ninja_deps
 .ninja_log
 build.ninja
+
+# external dependencies
+tdmpc2/
+temp_diffrl/
+dflex/
+
+# experiment outputs
+results/
+r_plots/
+
+# checkpoints
+checkpoints/
+*.pt
+*.pth
+*.ckpt
